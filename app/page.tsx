@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 /* -------------------------------------------------------------------------- */
@@ -10,8 +10,8 @@ import type { FormEvent, ReactNode } from "react";
 type View = "dashboard" | "stations" | "evs" | "reservations" | "admin";
 type ConnectorType = "CCS2" | "Type 2";
 type ChargingPointId = string;
-type ReservationStatus = "Confirmed" | "Cancelled";
-type DisplayStatus = "Confirmed" | "In progress" | "Completed" | "Cancelled";
+type ReservationStatus = "Booked" | "Confirmed" | "Cancelled" | "Completed" | "No-show";
+type DisplayStatus = "Booked" | "Confirmed" | "In progress" | "Completed" | "Cancelled" | "No-show";
 type FeedbackKind = "success" | "error" | "info";
 
 interface Feedback {
@@ -36,9 +36,19 @@ interface Station {
   pointIds: ChargingPointId[];
 }
 
-interface ChargingPoint {
+interface ApiChargingPoint {
   id: ChargingPointId;
-  stationId: number;
+  connector: string;
+  powerKW: number;
+  tariffPerKWh: number;
+}
+
+interface ApiStation {
+  id: number;
+  name: string;
+  location: string;
+  city: string;
+  chargingPoints: ApiChargingPoint[];
 }
 
 interface Ev {
@@ -64,17 +74,54 @@ interface Reservation {
 }
 
 interface ReservationForm {
-  stationId: number;
-  pointId: ChargingPointId;
-  evId: string;
+  stationId: number | null;
+  pointId: number | null;
+  evId: number | null;
+  tariffId: number | null;
   start: string;
   end: string;
 }
 
-interface Estimate {
-  hours: number;
-  energyKWh: number;
-  cost: number;
+interface BookingVehicle {
+  id: number;
+  userId: number;
+  number: string;
+  model: string;
+}
+
+interface BookingTariff {
+  id: number;
+  ratePerKWh: number;
+}
+
+interface BookingPoint {
+  id: number;
+  connector: string;
+  powerKW: number;
+  status: string;
+  tariffs: BookingTariff[];
+}
+
+interface BookingStation {
+  id: number;
+  name: string;
+  location: string;
+  city: string;
+  points: BookingPoint[];
+}
+
+interface ApiReservation {
+  id: number;
+  userId: number | null;
+  stationName: string;
+  location: string;
+  city: string;
+  pointId: string;
+  vehicle: string;
+  startMs: number;
+  endMs: number;
+  powerKW: number;
+  status: ReservationStatus;
 }
 
 interface StationDraft {
@@ -204,8 +251,232 @@ function toConnector(value: string): ConnectorType | null {
   return value === "CCS2" || value === "Type 2" ? value : null;
 }
 
-function getPoints(station: Station): ChargingPoint[] {
-  return station.pointIds.map((id) => ({ id, stationId: station.id }));
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseId(value: unknown): number {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
+    throw new Error("The API returned an invalid database ID.");
+  }
+  const id = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(id)) throw new Error("The API returned an invalid database ID.");
+  return id;
+}
+
+function parseText(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new Error(`The API returned an invalid ${field}.`);
+  return value;
+}
+
+function parseReservationStatus(value: unknown): ReservationStatus {
+  const status = parseText(value, "reservation status");
+  if (
+    status === "Booked" ||
+    status === "Confirmed" ||
+    status === "Cancelled" ||
+    status === "Completed" ||
+    status === "No-show"
+  ) {
+    return status;
+  }
+  throw new Error("The reservations API returned an unsupported reservation status.");
+}
+
+function parseNumber(value: unknown, field: string): number {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
+    throw new Error(`The API returned an invalid ${field}.`);
+  }
+  const number = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(number)) throw new Error(`The API returned an invalid ${field}.`);
+  return number;
+}
+
+function parseStationsResponse(value: unknown): Omit<ApiStation, "chargingPoints">[] {
+  if (!isRecord(value) || value.success !== true || !Array.isArray(value.data)) {
+    throw new Error("The stations API returned an invalid response.");
+  }
+
+  return value.data.map((row: unknown) => {
+    if (!isRecord(row)) throw new Error("The stations API returned an invalid station.");
+    return {
+      id: parseId(row.station_id),
+      name: parseText(row.station_name, "station name"),
+      location: parseText(row.location, "station location"),
+      city: parseText(row.city, "station city"),
+    };
+  });
+}
+
+function parseChargingPointsResponse(value: unknown): Array<{
+  stationId: number;
+  point: ApiChargingPoint;
+}> {
+  if (!isRecord(value) || value.success !== true || !Array.isArray(value.chargingPoints)) {
+    throw new Error("The booking options API returned an invalid response.");
+  }
+
+  return value.chargingPoints.map((row: unknown) => {
+    if (!isRecord(row)) throw new Error("The booking options API returned an invalid charging point.");
+    return {
+      stationId: parseId(row.station_id),
+      point: {
+        id: String(parseId(row.point_id)),
+        connector: parseText(row.connector_type, "connector type"),
+        powerKW: parseNumber(row.power_kw, "power rating"),
+        tariffPerKWh: parseNumber(row.rate_per_kwh, "tariff"),
+      },
+    };
+  });
+}
+
+function parseBookingOptions(value: unknown): {
+  vehicles: BookingVehicle[];
+  stations: BookingStation[];
+} {
+  if (
+    !isRecord(value) ||
+    value.success !== true ||
+    !Array.isArray(value.vehicles) ||
+    !Array.isArray(value.chargingPoints)
+  ) {
+    throw new Error("The booking options API returned an invalid response.");
+  }
+
+  const vehicles = value.vehicles.map((row: unknown): BookingVehicle => {
+    if (!isRecord(row)) throw new Error("The booking options API returned an invalid vehicle.");
+    return {
+      id: parseId(row.ev_id),
+      userId: parseId(row.user_id),
+      number: parseText(row.vehicle_number, "vehicle number"),
+      model: parseText(row.model, "vehicle model"),
+    };
+  });
+
+  const stationsById = new Map<number, BookingStation>();
+  const pointsById = new Map<number, { stationId: number; point: BookingPoint }>();
+  for (const row of value.chargingPoints as unknown[]) {
+    if (!isRecord(row)) throw new Error("The booking options API returned an invalid charging point.");
+    const stationId = parseId(row.station_id);
+    const pointId = parseId(row.point_id);
+    const status = parseText(row.status, "charging-point status");
+    let station = stationsById.get(stationId);
+    if (!station) {
+      station = {
+        id: stationId,
+        name: parseText(row.station_name, "station name"),
+        location: parseText(row.location, "station location"),
+        city: parseText(row.city, "station city"),
+        points: [],
+      };
+      stationsById.set(stationId, station);
+    }
+
+    let entry = pointsById.get(pointId);
+    if (!entry) {
+      entry = {
+        stationId,
+        point: {
+          id: pointId,
+          connector: parseText(row.connector_type, "connector type"),
+          powerKW: parseNumber(row.power_kw, "power rating"),
+          status,
+          tariffs: [],
+        },
+      };
+      pointsById.set(pointId, entry);
+      if (status === "Available") station.points.push(entry.point);
+    } else if (entry.stationId !== stationId) {
+      throw new Error(`Charging point ${pointId} references multiple stations.`);
+    }
+
+    const tariff = {
+      id: parseId(row.tariff_id),
+      ratePerKWh: parseNumber(row.rate_per_kwh, "tariff"),
+    };
+    if (!entry.point.tariffs.some((existing) => existing.id === tariff.id)) {
+      entry.point.tariffs.push(tariff);
+    }
+  }
+
+  return { vehicles, stations: Array.from(stationsById.values()) };
+}
+
+function parseReservationHistory(value: unknown, vehicles: BookingVehicle[]): ApiReservation[] {
+  if (!isRecord(value) || value.success !== true || !Array.isArray(value.data)) {
+    throw new Error("The reservations API returned an invalid response.");
+  }
+
+  return value.data.map((row: unknown): ApiReservation => {
+    if (!isRecord(row)) throw new Error("The reservations API returned an invalid reservation.");
+    const startMs = Date.parse(parseText(row.start_time, "reservation start time"));
+    const endMs = Date.parse(parseText(row.end_time, "reservation end time"));
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      throw new Error("The reservations API returned an invalid reservation time.");
+    }
+    const vehicleNumber = parseText(row.vehicle_number, "reservation vehicle number");
+    return {
+      id: parseId(row.reservation_id),
+      userId: vehicles.find((vehicle) => vehicle.number === vehicleNumber)?.userId ?? null,
+      stationName: parseText(row.station_name, "reservation station name"),
+      location: parseText(row.location, "reservation station location"),
+      city: parseText(row.city, "reservation station city"),
+      pointId: String(parseId(row.point_id)),
+      vehicle: `${parseText(row.ev_model, "reservation vehicle model")} (${vehicleNumber})`,
+      startMs,
+      endMs,
+      powerKW: parseNumber(row.power_kw, "reservation charger power"),
+      status: parseReservationStatus(row.status),
+    };
+  }).sort((left, right) => right.startMs - left.startMs);
+}
+
+async function readApiResponse(response: Response): Promise<Record<string, unknown>> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("The server returned an unreadable response.");
+  }
+
+  const message =
+    isRecord(payload) && typeof payload.message === "string"
+      ? payload.message
+      : `The request failed with status ${response.status}.`;
+  if (!response.ok || !isRecord(payload) || payload.success !== true) {
+    if (response.status === 409) {
+      throw new Error(`${message} The point may no longer be available; refresh booking options and try again.`);
+    }
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function combineApiStations(
+  stations: Omit<ApiStation, "chargingPoints">[],
+  chargingPoints: Array<{ stationId: number; point: ApiChargingPoint }>
+): ApiStation[] {
+  const stationIds = new Set(stations.map((station) => station.id));
+  const pointsByStation = new Map<number, ApiChargingPoint[]>();
+  for (const { stationId, point } of chargingPoints) {
+    if (!stationIds.has(stationId)) {
+      throw new Error(`Charging point ${point.id} references an unknown station.`);
+    }
+    const points = pointsByStation.get(stationId) ?? [];
+    points.push(point);
+    pointsByStation.set(stationId, points);
+  }
+
+  return stations.map((station) => ({
+    ...station,
+    chargingPoints: pointsByStation.get(station.id) ?? [],
+  }));
 }
 
 function derivePrefix(station: Station): string {
@@ -217,113 +488,18 @@ function isLive(r: Reservation, nowMs: number): boolean {
   return r.status === "Confirmed" && r.endMs > nowMs;
 }
 
-function displayStatus(r: Reservation, nowMs: number): DisplayStatus {
-  if (r.status === "Cancelled") return "Cancelled";
-  if (nowMs > 0 && r.endMs <= nowMs) return "Completed";
-  if (nowMs > 0 && r.startMs <= nowMs) return "In progress";
+function displayApiStatus(reservation: ApiReservation, nowMs: number): DisplayStatus {
+  if (reservation.status === "Cancelled") return "Cancelled";
+  if (reservation.status === "Completed") return "Completed";
+  if (reservation.status === "No-show") return "No-show";
+  if (reservation.status === "Booked" && reservation.endMs > nowMs) return "Booked";
+  if (reservation.endMs <= nowMs) return "Completed";
+  if (reservation.startMs <= nowMs) return "In progress";
   return "Confirmed";
 }
 
-/**
- * Demo-only overlap check.
- * NOTE: The backend and database MUST enforce this same rule during real API
- * integration (e.g. inside a transaction with row locking or a database-level
- * constraint), including for concurrent booking requests. This frontend check
- * can be bypassed and cannot prevent race conditions.
- *
- * Overlap condition: newStart < existingEnd && newEnd > existingStart
- * Adjacent bookings (end === start) are allowed. Cancelled bookings are ignored.
- */
-function findConflict(
-  reservations: Reservation[],
-  stationId: number,
-  pointId: ChargingPointId,
-  newStart: number,
-  newEnd: number
-): Reservation | undefined {
-  return reservations.find(
-    (r) =>
-      r.status === "Confirmed" &&
-      r.stationId === stationId &&
-      r.pointId === pointId &&
-      newStart < r.endMs &&
-      newEnd > r.startMs
-  );
-}
-
-function computeEstimate(startMs: number, endMs: number, station: Station | undefined): Estimate | null {
-  if (!station || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
-  const hours = (endMs - startMs) / 3600000;
-  const energyKWh = hours * station.powerKW;
-  const cost = energyKWh * station.tariffPerKWh;
-  return { hours, energyKWh, cost };
-}
-
-interface ValidReservation {
-  startMs: number;
-  endMs: number;
-  station: Station;
-  ev: Ev;
-  estimate: Estimate;
-}
-
-function validateReservation(args: {
-  station: Station | undefined;
-  pointId: ChargingPointId;
-  ev: Ev | undefined;
-  start: string;
-  end: string;
-  reservations: Reservation[];
-  nowMs: number;
-}): Validation<ValidReservation> {
-  const { station, pointId, ev, start, end, reservations, nowMs } = args;
-  const missing: string[] = [];
-  if (!station) missing.push("charging station");
-  if (!pointId) missing.push("charging point");
-  if (!ev) missing.push("EV");
-  if (!start) missing.push("start date and time");
-  if (!end) missing.push("end date and time");
-  if (missing.length > 0 || !station || !ev) {
-    return { ok: false, error: `Please fill in all required fields: ${missing.join(", ")}.` };
-  }
-
-  const startMs = parseLocal(start);
-  const endMs = parseLocal(end);
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
-    return { ok: false, error: "Please enter a valid start and end date/time." };
-  }
-  if (startMs <= nowMs) {
-    return { ok: false, error: "The start time must be in the future. Please pick a later start time." };
-  }
-  if (endMs <= startMs) {
-    return { ok: false, error: "The end time must be later than the start time." };
-  }
-  if (!station.pointIds.includes(pointId)) {
-    return { ok: false, error: "The selected charging point does not belong to the selected station." };
-  }
-
-  const conflict = findConflict(reservations, station.id, pointId, startMs, endMs);
-  if (conflict) {
-    const freeAlternatives = station.pointIds.filter(
-      (p) => p !== pointId && !findConflict(reservations, station.id, p, startMs, endMs)
-    );
-    const suggestion =
-      freeAlternatives.length > 0
-        ? ` Free in this time window: ${freeAlternatives.join(", ")}.`
-        : " No other point at this station is free in this window; try a different time.";
-    return {
-      ok: false,
-      error: `${pointId} is already reserved from ${formatDateTime(conflict.startMs)} to ${formatDateTime(
-        conflict.endMs
-      )} (${conflict.ref}).${suggestion}`,
-    };
-  }
-
-  const estimate = computeEstimate(startMs, endMs, station);
-  if (!estimate) {
-    return { ok: false, error: "Unable to estimate this booking. Please check the start and end times." };
-  }
-  return { ok: true, value: { startMs, endMs, station, ev, estimate } };
+function isApiReservationCancellable(reservation: ApiReservation): boolean {
+  return reservation.userId !== null && ["Booked", "Confirmed"].includes(reservation.status);
 }
 
 function validateStationDraft(
@@ -537,10 +713,12 @@ function ConnectorBadge({ connector }: { connector: ConnectorType }) {
 
 function StatusBadge({ status }: { status: DisplayStatus }) {
   const styles: Record<DisplayStatus, string> = {
+    Booked: "bg-amber-50 text-amber-700 ring-amber-200",
     Confirmed: "bg-emerald-50 text-emerald-700 ring-emerald-200",
     "In progress": "bg-sky-50 text-sky-700 ring-sky-200",
     Completed: "bg-slate-100 text-slate-700 ring-slate-200",
     Cancelled: "bg-red-50 text-red-700 ring-red-200",
+    "No-show": "bg-red-50 text-red-700 ring-red-200",
   };
   return (
     <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset ${styles[status]}`}>
@@ -609,38 +787,48 @@ function ReservationCard({
   reservation,
   nowMs,
   onCancel,
+  cancelling,
 }: {
-  reservation: Reservation;
+  reservation: ApiReservation;
   nowMs: number;
-  onCancel: (ref: string) => void;
+  onCancel: (id: number) => void;
+  cancelling: boolean;
 }) {
-  const status = displayStatus(reservation, nowMs);
-  const canCancel = isLive(reservation, nowMs);
+  const status = displayApiStatus(reservation, nowMs);
+  const canCancel = isApiReservationCancellable(reservation);
+  const energyKWh = (reservation.endMs - reservation.startMs) / 3600000 * reservation.powerKW;
   return (
     <li className="rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono text-xs font-semibold text-[#0f1b3d]">
-            {reservation.ref}
+            #{reservation.id}
           </span>
           <StatusBadge status={status} />
         </div>
         {canCancel ? (
-          <button type="button" onClick={() => onCancel(reservation.ref)} className={`${btnDanger} px-3 py-1.5`}>
-            Cancel reservation
+          <button
+            type="button"
+            onClick={() => onCancel(reservation.id)}
+            disabled={cancelling}
+            className={`${btnDanger} px-3 py-1.5`}
+          >
+            {cancelling ? "Cancelling…" : "Cancel reservation"}
           </button>
         ) : status === "Cancelled" ? (
           <span className="text-xs text-slate-500">Cancelled · charging point released</span>
+        ) : !reservation.userId ? (
+          <span className="text-xs text-slate-500">This reservation belongs to another account.</span>
         ) : null}
       </div>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         <DetailItem label="Station" value={reservation.stationName} />
+        <DetailItem label="Location" value={`${reservation.location}, ${reservation.city}`} />
         <DetailItem label="Charging point" value={reservation.pointId} />
         <DetailItem label="Vehicle" value={reservation.vehicle} />
         <DetailItem label="Start" value={formatDateTime(reservation.startMs)} />
         <DetailItem label="End" value={formatDateTime(reservation.endMs)} />
-        <DetailItem label="Est. energy" value={`${formatNumber2(reservation.energyKWh)} kWh`} />
-        <DetailItem label="Est. cost" value={formatINR(reservation.cost)} />
+        <DetailItem label="Est. energy" value={`${formatNumber2(energyKWh)} kWh`} />
       </dl>
     </li>
   );
@@ -657,15 +845,21 @@ function DashboardView({
   reservations,
   liveCount,
   nowMs,
+  historyLoading,
+  historyError,
+  onRetryHistory,
   onReserve,
   onNavigate,
 }: {
   stations: Station[];
   availableByStation: Map<number, number>;
   totalAvailable: number;
-  reservations: Reservation[];
+  reservations: ApiReservation[];
   liveCount: number;
   nowMs: number;
+  historyLoading: boolean;
+  historyError: string | null;
+  onRetryHistory: () => void;
   onReserve: (stationId: number) => void;
   onNavigate: (view: View) => void;
 }) {
@@ -680,8 +874,7 @@ function DashboardView({
         <p className="text-sm font-medium text-emerald-100">Welcome back 👋</p>
         <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">Welcome to VoltReserve</h1>
         <p className="mt-2 max-w-xl text-sm text-emerald-50">
-          Find a charging station, pick a charging point, and reserve a slot for your EV. Everything on this screen is
-          sample data for demonstration.
+          Find a charging station, pick an available charging point, and reserve a slot for your EV.
         </p>
         <div className="mt-5 flex flex-wrap gap-3">
           <button
@@ -702,8 +895,8 @@ function DashboardView({
       </section>
 
       <DemoNotice>
-        <strong>Demo data:</strong> stations, vehicles and reservations shown here are sample values stored in browser
-        memory only. They are not loaded from MySQL or MongoDB, and refreshing the page may reset them.
+        Station summary cards and My EV/admin tools use demo data. Booking options and reservation history are loaded
+        from MySQL.
       </DemoNotice>
 
       <section aria-label="Statistics" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -715,12 +908,23 @@ function DashboardView({
           icon="🔌"
         />
         <StatCard
-          label="Reservations this session"
-          value={String(reservations.length)}
-          hint={`${cancelled} cancelled`}
+          label="Reservations"
+          value={historyLoading || historyError ? "—" : String(reservations.length)}
+          hint={
+            historyLoading
+              ? "Loading reservation history"
+              : historyError
+                ? "History unavailable"
+                : `${cancelled} cancelled`
+          }
           icon="🗓"
         />
-        <StatCard label="Active bookings" value={String(liveCount)} hint="Upcoming or in progress" icon="✅" />
+        <StatCard
+          label="Active bookings"
+          value={historyLoading || historyError ? "—" : String(liveCount)}
+          hint={historyError ? "History unavailable" : "Upcoming or in progress"}
+          icon="✅"
+        />
       </section>
 
       <section className="mt-8" aria-labelledby="featured-heading">
@@ -763,11 +967,26 @@ function DashboardView({
             </button>
           ) : null}
         </div>
-        {recent.length === 0 ? (
+        {historyLoading ? (
+          <div role="status" className={`${cardCls} px-6 py-10 text-center text-sm text-slate-600`}>
+            Loading reservation history…
+          </div>
+        ) : historyError ? (
+          <EmptyState
+            icon="⚠️"
+            title="Could not load reservation history"
+            message={historyError}
+            action={
+              <button type="button" onClick={onRetryHistory} className={btnPrimary}>
+                Retry
+              </button>
+            }
+          />
+        ) : recent.length === 0 ? (
           <EmptyState
             icon="🗓"
             title="No reservations yet"
-            message="Reservations you create in this browser session will appear here."
+            message="Reservations created through the booking form will appear here."
             action={
               <button type="button" onClick={() => onNavigate("reservations")} className={btnPrimary}>
                 Create a reservation
@@ -777,18 +996,20 @@ function DashboardView({
         ) : (
           <ul className={`${cardCls} divide-y divide-slate-100`}>
             {recent.map((r) => (
-              <li key={r.ref} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+            <li key={r.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
                 <div>
                   <p className="text-sm font-semibold text-[#0f1b3d]">
                     {r.stationName} · {r.pointId}
                   </p>
                   <p className="text-xs text-slate-500">
-                    {r.ref} · {formatDateTime(r.startMs)} → {formatDateTime(r.endMs)}
+                    #{r.id} · {formatDateTime(r.startMs)} → {formatDateTime(r.endMs)}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="text-sm font-semibold text-[#0f1b3d]">{formatINR(r.cost)}</span>
-                  <StatusBadge status={displayStatus(r, nowMs)} />
+                  <span className="text-xs text-slate-600">
+                    {formatNumber2(((r.endMs - r.startMs) / 3600000) * r.powerKW)} kWh est.
+                  </span>
+                  <StatusBadge status={displayApiStatus(r, nowMs)} />
                 </div>
               </li>
             ))}
@@ -800,19 +1021,70 @@ function DashboardView({
 }
 
 function StationsView({
-  stations,
-  availableByStation,
   onReserve,
 }: {
-  stations: Station[];
-  availableByStation: Map<number, number>;
   onReserve: (stationId: number) => void;
 }) {
   const [query, setQuery] = useState<string>("");
   const [city, setCity] = useState<string>("All");
-  const [connector, setConnector] = useState<"All" | ConnectorType>("All");
+  const [connector, setConnector] = useState<string>("All");
+  const [stations, setStations] = useState<ApiStation[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState<number>(0);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadStations() {
+      setLoading(true);
+      setError(null);
+
+      try {
+        const [stationsResponse, optionsResponse] = await Promise.all([
+          fetch("/api/stations"),
+          fetch("/api/booking-options"),
+        ]);
+        if (!stationsResponse.ok || !optionsResponse.ok) {
+          throw new Error("Could not load station data. Please try again.");
+        }
+
+        const [stationsPayload, optionsPayload]: [unknown, unknown] = await Promise.all([
+          stationsResponse.json(),
+          optionsResponse.json(),
+        ]);
+        const stationRows = parseStationsResponse(stationsPayload);
+        const chargingPoints = parseChargingPointsResponse(optionsPayload);
+
+        if (!cancelled) setStations(combineApiStations(stationRows, chargingPoints));
+      } catch (loadError) {
+        if (!cancelled) {
+          setStations([]);
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : "Could not load station data. Please try again."
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void loadStations();
+    return () => {
+      cancelled = true;
+    };
+  }, [retryCount]);
 
   const cityOptions = useMemo(() => Array.from(new Set(stations.map((s) => s.city))).sort(), [stations]);
+  const connectorOptions = useMemo(
+    () =>
+      Array.from(
+        new Set(stations.flatMap((station) => station.chargingPoints.map((point) => point.connector)))
+      ).sort(),
+    [stations]
+  );
   const effectiveCity = city === "All" || cityOptions.includes(city) ? city : "All";
 
   const filtered = useMemo(() => {
@@ -821,7 +1093,7 @@ function StationsView({
       (s) =>
         (q === "" || s.name.toLowerCase().includes(q)) &&
         (effectiveCity === "All" || s.city === effectiveCity) &&
-        (connector === "All" || s.connector === connector)
+        (connector === "All" || s.chargingPoints.some((point) => point.connector === connector))
     );
   }, [stations, query, effectiveCity, connector]);
 
@@ -859,11 +1131,11 @@ function StationsView({
           <select
             id="station-connector"
             value={connector}
-            onChange={(e) => setConnector(toConnector(e.target.value) ?? "All")}
+            onChange={(e) => setConnector(e.target.value)}
             className={inputCls}
           >
             <option value="All">All connectors</option>
-            {CONNECTORS.map((c) => (
+            {connectorOptions.map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>
@@ -877,7 +1149,28 @@ function StationsView({
         <strong className="text-[#0f1b3d]">{stations.length}</strong> stations
       </p>
 
-      {filtered.length === 0 ? (
+      {loading ? (
+        <div role="status" className={`${cardCls} px-6 py-12 text-center text-sm text-slate-600`}>
+          Loading charging stations…
+        </div>
+      ) : error ? (
+        <EmptyState
+          icon="⚠️"
+          title="Could not load charging stations"
+          message={error}
+          action={
+            <button type="button" onClick={() => setRetryCount((count) => count + 1)} className={btnPrimary}>
+              Retry
+            </button>
+          }
+        />
+      ) : stations.length === 0 ? (
+        <EmptyState
+          icon="⚡"
+          title="No charging stations available"
+          message="The stations API did not return any station records."
+        />
+      ) : filtered.length === 0 ? (
         <EmptyState
           icon="🔎"
           title="No stations match your filters"
@@ -891,7 +1184,7 @@ function StationsView({
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((s) => (
-            <StationCard key={s.id} station={s} available={availableByStation.get(s.id) ?? 0} onReserve={onReserve} />
+            <ApiStationCard key={s.id} station={s} onReserve={onReserve} />
           ))}
         </div>
       )}
@@ -899,47 +1192,127 @@ function StationsView({
   );
 }
 
+function ApiStationCard({
+  station,
+  onReserve,
+}: {
+  station: ApiStation;
+  onReserve: (stationId: number) => void;
+}) {
+  const connectorTypes = Array.from(new Set(station.chargingPoints.map((point) => point.connector)));
+
+  return (
+    <article className={`${cardCls} flex flex-col p-5 transition hover:border-emerald-300 hover:shadow-md`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">📍 {station.city}</p>
+          <h3 className="mt-1 text-lg font-semibold text-[#0f1b3d]">{station.name}</h3>
+          <p className="mt-1 text-sm text-slate-600">{station.location}</p>
+        </div>
+        {connectorTypes.length > 0 ? (
+          <div className="flex flex-wrap justify-end gap-1">
+            {connectorTypes.map((connector) => (
+              <span
+                key={connector}
+                className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200"
+              >
+                {connector}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="mt-4">
+        <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+          Available charging points ({station.chargingPoints.length})
+        </p>
+        {station.chargingPoints.length > 0 ? (
+          <ul className="mt-2 divide-y divide-slate-100 rounded-xl border border-slate-200">
+            {station.chargingPoints.map((point) => (
+              <li key={point.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                <span className="font-mono text-sm font-semibold text-[#0f1b3d]">{point.id}</span>
+                <span className="text-xs text-slate-600">
+                  {point.connector} · {point.powerKW} kW · ₹{point.tariffPerKWh}/kWh
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-sm text-slate-600">No available charging points were returned for this station.</p>
+        )}
+      </div>
+
+      <button
+        type="button"
+        onClick={() => onReserve(station.id)}
+        disabled={station.chargingPoints.length === 0}
+        className={`${btnPrimary} mt-5 w-full`}
+      >
+        Reserve
+      </button>
+    </article>
+  );
+}
+
 function ReservationsView({
   stations,
-  evs,
+  vehicles,
   reservations,
   form,
-  station,
-  pointId,
-  ev,
   nowMs,
   formFeedback,
   historyFeedback,
+  optionsLoading,
+  optionsError,
+  historyLoading,
+  historyError,
+  submitting,
+  cancellingId,
   onStationChange,
   onPointChange,
+  onTariffChange,
   onFieldChange,
   onQuickFill,
   onSubmit,
   onCancel,
-  onNavigate,
+  onRetryOptions,
+  onRetryHistory,
 }: {
-  stations: Station[];
-  evs: Ev[];
-  reservations: Reservation[];
+  stations: BookingStation[];
+  vehicles: BookingVehicle[];
+  reservations: ApiReservation[];
   form: ReservationForm;
-  station: Station | undefined;
-  pointId: ChargingPointId;
-  ev: Ev | undefined;
   nowMs: number;
   formFeedback: Feedback | null;
   historyFeedback: Feedback | null;
+  optionsLoading: boolean;
+  optionsError: string | null;
+  historyLoading: boolean;
+  historyError: string | null;
+  submitting: boolean;
+  cancellingId: number | null;
   onStationChange: (stationId: number) => void;
-  onPointChange: (pointId: ChargingPointId) => void;
+  onPointChange: (pointId: number) => void;
+  onTariffChange: (tariffId: number) => void;
   onFieldChange: (patch: Partial<ReservationForm>) => void;
   onQuickFill: () => void;
   onSubmit: () => void;
-  onCancel: (ref: string) => void;
-  onNavigate: (view: View) => void;
+  onCancel: (id: number) => void;
+  onRetryOptions: () => void;
+  onRetryHistory: () => void;
 }) {
+  const station = stations.find((item) => item.id === form.stationId);
+  const point = station?.points.find((item) => item.id === form.pointId);
+  const tariff = point?.tariffs.find((item) => item.id === form.tariffId);
+  const vehicle = vehicles.find((item) => item.id === form.evId);
   const startMs = parseLocal(form.start);
   const endMs = parseLocal(form.end);
-  const hasRange = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs;
-  const estimate = computeEstimate(startMs, endMs, station);
+  const hours = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+    ? (endMs - startMs) / 3600000
+    : null;
+  const energyKWh = hours !== null && point ? hours * point.powerKW : null;
+  const cost = energyKWh !== null && tariff ? energyKWh * tariff.ratePerKWh : null;
 
   const startError =
     form.start && Number.isFinite(startMs) && nowMs > 0 && startMs <= nowMs
@@ -950,39 +1323,12 @@ function ReservationsView({
       ? "End time must be later than the start time."
       : undefined;
 
-  const busyPoints =
-  station && hasRange
-    ? new Set(
-        station.pointIds.filter((pointId) =>
-          findConflict(
-            reservations,
-            station.id,
-            pointId,
-            startMs,
-            endMs
-          )
-        )
-      )
-    : new Set<string>();
-
-  const warnings: string[] = [];
-  if (ev && station && ev.connector !== station.connector) {
-    warnings.push(
-      `${ev.model} uses a ${ev.connector} connector but ${station.name} offers ${station.connector}. This is only a warning in the demo.`
-    );
-  }
-  if (ev && estimate && estimate.energyKWh > ev.batteryKWh) {
-    warnings.push(
-      `The estimated energy exceeds ${ev.model}'s battery capacity (${ev.batteryKWh} kWh); a real session would stop when the battery is full.`
-    );
-  }
-
   const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     onSubmit();
   };
 
-  const canShowForm = stations.length > 0 && evs.length > 0;
+  const canShowForm = stations.length > 0 && vehicles.length > 0;
 
   return (
     <div>
@@ -990,28 +1336,29 @@ function ReservationsView({
         title="Reservations"
         subtitle="Reserve a charging point for your EV and review your reservation history."
       />
-      <DemoNotice>
-        Reservations are kept in React state only. Refreshing the page may reset the demo data, and nothing is saved to
-        MySQL yet.
-      </DemoNotice>
-
-      {!canShowForm ? (
+      {optionsLoading ? (
+        <div role="status" className={`${cardCls} px-6 py-10 text-center text-sm text-slate-600`}>
+          Loading vehicles and available charging points…
+        </div>
+      ) : optionsError ? (
+        <EmptyState
+          icon="⚠️"
+          title="Could not load booking options"
+          message={optionsError}
+          action={
+            <button type="button" onClick={onRetryOptions} className={btnPrimary}>
+              Retry
+            </button>
+          }
+        />
+      ) : !canShowForm ? (
         <EmptyState
           icon="📝"
-          title={stations.length === 0 ? "No stations available" : "No vehicles available"}
+          title={stations.length === 0 ? "No available charging points" : "No vehicles available"}
           message={
             stations.length === 0
-              ? "Add at least one charging station in the Admin page before making a reservation."
-              : "Add at least one EV in the My EVs page before making a reservation."
-          }
-          action={
-            <button
-              type="button"
-              onClick={() => onNavigate(stations.length === 0 ? "admin" : "evs")}
-              className={btnPrimary}
-            >
-              {stations.length === 0 ? "Go to Admin" : "Go to My EVs"}
-            </button>
+              ? "No available station and charging-point combinations were returned by the booking options API."
+              : "No vehicles were returned by the booking options API."
           }
         />
       ) : (
@@ -1025,7 +1372,7 @@ function ReservationsView({
                 <select
                   id="res-station"
                   aria-required="true"
-                  value={station ? station.id : ""}
+                  value={station?.id ?? ""}
                   onChange={(e) => onStationChange(Number(e.target.value))}
                   className={inputCls}
                 >
@@ -1039,34 +1386,49 @@ function ReservationsView({
               <Field
                 id="res-point"
                 label="Charging point"
-                hint={station ? `${station.pointIds.length} points at this station` : undefined}
+                hint={station ? `${station.points.length} available points at this station` : undefined}
               >
                 <select
                   id="res-point"
                   aria-required="true"
-                  value={pointId}
-                  onChange={(e) => onPointChange(e.target.value)}
+                  value={point?.id ?? ""}
+                  onChange={(e) => onPointChange(Number(e.target.value))}
                   className={inputCls}
                 >
-                  {(station ? getPoints(station) : []).map((p) => (
+                  {(station?.points ?? []).map((p) => (
                     <option key={p.id} value={p.id}>
-                      {p.id}
-                      {busyPoints.has(p.id) ? " — busy in this time window" : ""}
+                      {p.id} · {p.connector} · {p.powerKW} kW
                     </option>
                   ))}
                 </select>
               </Field>
             </div>
 
+            <Field id="res-tariff" label="Tariff">
+              <select
+                id="res-tariff"
+                aria-required="true"
+                value={tariff?.id ?? ""}
+                onChange={(e) => onTariffChange(Number(e.target.value))}
+                className={inputCls}
+              >
+                {(point?.tariffs ?? []).map((option) => (
+                  <option key={option.id} value={option.id}>
+                    ₹{option.ratePerKWh}/kWh
+                  </option>
+                ))}
+              </select>
+            </Field>
+
             <Field id="res-ev" label="Electric vehicle">
               <select
                 id="res-ev"
                 aria-required="true"
-                value={ev ? ev.id : ""}
-                onChange={(e) => onFieldChange({ evId: e.target.value })}
+                value={vehicle?.id ?? ""}
+                onChange={(e) => onFieldChange({ evId: Number(e.target.value) })}
                 className={inputCls}
               >
-                {evs.map((v) => (
+                {vehicles.map((v) => (
                   <option key={v.id} value={v.id}>
                     {v.model} · {v.number}
                   </option>
@@ -1103,20 +1465,12 @@ function ReservationsView({
               <button type="button" onClick={onQuickFill} className={btnSecondary}>
                 ⏱ Quick fill: next hour, 1 h session
               </button>
-              <span className="text-xs text-slate-500">Adjacent bookings are allowed (end = next start).</span>
+              <span className="text-xs text-slate-500">Adjacent bookings are allowed.</span>
             </div>
 
-            {warnings.length > 0 ? (
-              <ul className="space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                {warnings.map((w) => (
-                  <li key={w}>⚠ {w}</li>
-                ))}
-              </ul>
-            ) : null}
-
             <div className="flex flex-wrap gap-3 border-t border-slate-100 pt-5">
-              <button type="submit" className={btnPrimary}>
-                Reserve charging point
+              <button type="submit" disabled={submitting || !point || point.status !== "Available"} className={btnPrimary}>
+                {submitting ? "Submitting…" : "Reserve charging point"}
               </button>
             </div>
           </form>
@@ -1130,32 +1484,32 @@ function ReservationsView({
             </div>
             {station ? (
               <dl className="grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
-                <DetailItem label="Charger power" value={`${station.powerKW} kW`} />
-                <DetailItem label="Tariff" value={`₹${station.tariffPerKWh}/kWh`} />
+                <DetailItem label="Charger power" value={point ? `${point.powerKW} kW` : "—"} />
+                <DetailItem label="Tariff" value={tariff ? `₹${tariff.ratePerKWh}/kWh` : "—"} />
               </dl>
             ) : null}
             <dl className="space-y-3">
               <div className="flex items-baseline justify-between">
                 <dt className="text-sm text-slate-600">Duration</dt>
                 <dd className="text-sm font-semibold text-[#0f1b3d]">
-                  {estimate ? `${formatNumber2(estimate.hours)} h` : "—"}
+                  {hours !== null ? `${formatNumber2(hours)} h` : "—"}
                 </dd>
               </div>
               <div className="flex items-baseline justify-between">
                 <dt className="text-sm text-slate-600">Estimated energy</dt>
                 <dd className="text-lg font-bold text-[#0f1b3d]">
-                  {estimate ? `${formatNumber2(estimate.energyKWh)} kWh` : "—"}
+                  {energyKWh !== null ? `${formatNumber2(energyKWh)} kWh` : "—"}
                 </dd>
               </div>
               <div className="flex items-baseline justify-between">
                 <dt className="text-sm text-slate-600">Estimated cost</dt>
-                <dd className="text-lg font-bold text-emerald-700">{estimate ? formatINR(estimate.cost) : "—"}</dd>
+                <dd className="text-lg font-bold text-emerald-700">{cost !== null ? formatINR(cost) : "—"}</dd>
               </div>
             </dl>
-            {estimate && station ? (
+            {hours !== null && point && energyKWh !== null && tariff && cost !== null ? (
               <p className="rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
-                {formatNumber2(estimate.hours)} h × {station.powerKW} kW = {formatNumber2(estimate.energyKWh)} kWh;{" "}
-                {formatNumber2(estimate.energyKWh)} kWh × ₹{station.tariffPerKWh} = {formatINR(estimate.cost)}
+                {formatNumber2(hours)} h × {point.powerKW} kW = {formatNumber2(energyKWh)} kWh;{" "}
+                {formatNumber2(energyKWh)} kWh × ₹{tariff.ratePerKWh} = {formatINR(cost)}
               </p>
             ) : (
               <p className="text-xs text-slate-500">
@@ -1173,25 +1527,50 @@ function ReservationsView({
       <section className="mt-8" aria-labelledby="history-heading">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 id="history-heading" className="text-lg font-semibold text-[#0f1b3d]">
-            Reservation history (this session)
+            Reservation history
           </h2>
           <span className="text-sm text-slate-600">
-            {reservations.length} reservation{reservations.length === 1 ? "" : "s"}
+            {historyLoading
+              ? "Loading…"
+              : historyError
+                ? "Unavailable"
+                : `${reservations.length} reservation${reservations.length === 1 ? "" : "s"}`}
           </span>
         </div>
         <div className="mb-4">
           <Alert feedback={historyFeedback} />
         </div>
-        {reservations.length === 0 ? (
+        {historyLoading ? (
+          <div role="status" className={`${cardCls} px-6 py-10 text-center text-sm text-slate-600`}>
+            Loading reservation history…
+          </div>
+        ) : historyError ? (
+          <EmptyState
+            icon="⚠️"
+            title="Could not load reservation history"
+            message={historyError}
+            action={
+              <button type="button" onClick={onRetryHistory} className={btnPrimary}>
+                Retry
+              </button>
+            }
+          />
+        ) : reservations.length === 0 ? (
           <EmptyState
             icon="🗓"
             title="No reservations yet"
-            message="Once you reserve a charging point, it will show up here with its status, estimated energy and cost."
+            message="Once you reserve a charging point, it will appear here with its status and reservation details."
           />
         ) : (
           <ul className="space-y-3">
             {reservations.map((r) => (
-              <ReservationCard key={r.ref} reservation={r} nowMs={nowMs} onCancel={onCancel} />
+              <ReservationCard
+                key={r.id}
+                reservation={r}
+                nowMs={nowMs}
+                onCancel={onCancel}
+                cancelling={cancellingId === r.id}
+              />
             ))}
           </ul>
         )}
@@ -1635,20 +2014,89 @@ export default function Page() {
 
   const [stations, setStations] = useState<Station[]>(INITIAL_STATIONS);
   const [evs, setEvs] = useState<Ev[]>(INITIAL_EVS);
-  const [reservations, setReservations] = useState<Reservation[]>([]);
+  const [reservations] = useState<Reservation[]>([]);
 
   const [form, setForm] = useState<ReservationForm>({
-    stationId: INITIAL_STATIONS[0].id,
-    pointId: INITIAL_STATIONS[0].pointIds[0],
-    evId: INITIAL_EVS[0].id,
+    stationId: null,
+    pointId: null,
+    evId: null,
+    tariffId: null,
     start: "",
     end: "",
   });
   const [formFeedback, setFormFeedback] = useState<Feedback | null>(null);
   const [historyFeedback, setHistoryFeedback] = useState<Feedback | null>(null);
+  const [bookingStations, setBookingStations] = useState<BookingStation[]>([]);
+  const [bookingVehicles, setBookingVehicles] = useState<BookingVehicle[]>([]);
+  const [bookingOptionsLoading, setBookingOptionsLoading] = useState<boolean>(true);
+  const [bookingOptionsError, setBookingOptionsError] = useState<string | null>(null);
+  const [apiReservations, setApiReservations] = useState<ApiReservation[]>([]);
+  const [historyLoading, setHistoryLoading] = useState<boolean>(true);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [cancellingId, setCancellingId] = useState<number | null>(null);
 
   const nextStationId = useRef<number>(5);
   const nextEvId = useRef<number>(4);
+
+  const loadBookingOptions = useCallback(async () => {
+    setBookingOptionsLoading(true);
+    setBookingOptionsError(null);
+    try {
+      const payload = await readApiResponse(await fetch("/api/booking-options"));
+      const options = parseBookingOptions(payload);
+      setBookingStations(options.stations);
+      setBookingVehicles(options.vehicles);
+      setForm((previous) => {
+        const station =
+          options.stations.find((item) => item.id === previous.stationId) ?? options.stations[0];
+        const point = station?.points.find((item) => item.id === previous.pointId) ?? station?.points[0];
+        const tariff = point?.tariffs.find((item) => item.id === previous.tariffId) ?? point?.tariffs[0];
+        const vehicle = options.vehicles.find((item) => item.id === previous.evId) ?? options.vehicles[0];
+        return {
+          ...previous,
+          stationId: station?.id ?? null,
+          pointId: point?.id ?? null,
+          tariffId: tariff?.id ?? null,
+          evId: vehicle?.id ?? null,
+        };
+      });
+    } catch (error) {
+      setBookingStations([]);
+      setBookingVehicles([]);
+      setBookingOptionsError(
+        error instanceof Error ? error.message : "Could not load booking options. Please try again."
+      );
+    } finally {
+      setBookingOptionsLoading(false);
+    }
+  }, []);
+
+  const loadReservationHistory = useCallback(async (): Promise<boolean> => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const payload = await readApiResponse(await fetch("/api/reservations"));
+      setApiReservations(parseReservationHistory(payload, bookingVehicles));
+      return true;
+    } catch (error) {
+      setApiReservations([]);
+      setHistoryError(
+        error instanceof Error ? error.message : "Could not load reservation history. Please try again."
+      );
+      return false;
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [bookingVehicles]);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadBookingOptions);
+  }, [loadBookingOptions]);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadReservationHistory);
+  }, [loadReservationHistory]);
 
   /* Clock: keeps "available now" and statuses fresh. Runs only on the client. */
   useEffect(() => {
@@ -1688,15 +2136,6 @@ export default function Page() {
     [availableByStation]
   );
 
-  /* The form's effective selections always stay consistent with current data. */
-  const formStation: Station | undefined = stations.find((s) => s.id === form.stationId) ?? stations[0];
-  const formPointId: ChargingPointId = formStation
-    ? formStation.pointIds.includes(form.pointId)
-      ? form.pointId
-      : formStation.pointIds[0] ?? ""
-    : "";
-  const formEv: Ev | undefined = evs.find((e) => e.id === form.evId) ?? evs[0];
-
   /* Navigation */
   const go = (next: View) => {
     setView(next);
@@ -1711,12 +2150,24 @@ export default function Page() {
   };
 
   const handleStationChange = (stationId: number) => {
-    const target = stations.find((s) => s.id === stationId);
-    updateForm({ stationId, pointId: target ? target.pointIds[0] ?? "" : "" });
+    const target = bookingStations.find((station) => station.id === stationId);
+    const point = target?.points[0];
+    updateForm({
+      stationId,
+      pointId: point?.id ?? null,
+      tariffId: point?.tariffs[0]?.id ?? null,
+    });
   };
 
-  const handlePointChange = (pointId: ChargingPointId) => {
-    updateForm({ stationId: formStation ? formStation.id : form.stationId, pointId });
+  const handlePointChange = (pointId: number) => {
+    const point = bookingStations
+      .find((station) => station.id === form.stationId)
+      ?.points.find((item) => item.id === pointId);
+    updateForm({ pointId, tariffId: point?.tariffs[0]?.id ?? null });
+  };
+
+  const handleTariffChange = (tariffId: number) => {
+    updateForm({ tariffId });
   };
 
   const handleQuickFill = () => {
@@ -1725,80 +2176,129 @@ export default function Page() {
   };
 
   const openReserve = (stationId: number) => {
-    const target = stations.find((s) => s.id === stationId);
-    if (!target) return;
-    setForm((prev) => ({ ...prev, stationId: target.id, pointId: target.pointIds[0] ?? "" }));
+    const target = bookingStations.find((station) => station.id === stationId);
+    if (target && target.points.length > 0) {
+      const point = target.points[0];
+      setForm((prev) => ({
+        ...prev,
+        stationId: target.id,
+        pointId: point.id,
+        tariffId: point.tariffs[0]?.id ?? null,
+      }));
+    }
     setFormFeedback(null);
     go("reservations");
   };
 
-  const submitReservation = () => {
-    const result = validateReservation({
-      station: formStation,
-      pointId: formPointId,
-      ev: formEv,
-      start: form.start,
-      end: form.end,
-      reservations,
-      nowMs: Date.now(),
-    });
-    if (!result.ok) {
-      setFormFeedback({ kind: "error", text: result.error });
+  const submitReservation = async () => {
+    const station = bookingStations.find((item) => item.id === form.stationId);
+    const point = station?.points.find((item) => item.id === form.pointId);
+    const tariff = point?.tariffs.find((item) => item.id === form.tariffId);
+    const vehicle = bookingVehicles.find((item) => item.id === form.evId);
+    const missing: string[] = [];
+    if (!station) missing.push("charging station");
+    if (!point) missing.push("charging point");
+    if (!tariff) missing.push("tariff");
+    if (!vehicle) missing.push("electric vehicle");
+    if (!form.start) missing.push("start date and time");
+    if (!form.end) missing.push("end date and time");
+    if (missing.length > 0 || !station || !point || !tariff || !vehicle) {
+      setFormFeedback({ kind: "error", text: `Please select or enter: ${missing.join(", ")}.` });
       return;
     }
-    const { station, ev, startMs, endMs, estimate } = result.value;
-    const ref = `VR-${String(reservations.length + 1).padStart(4, "0")}`;
-    const created: Reservation = {
-      ref,
-      stationId: station.id,
-      stationName: station.name,
-      pointId: formPointId,
-      evId: ev.id,
-      vehicle: `${ev.model} (${ev.number})`,
-      startMs,
-      endMs,
-      energyKWh: estimate.energyKWh,
-      cost: estimate.cost,
-      status: "Confirmed",
-    };
-    setReservations((prev) => [created, ...prev]);
-    setNowMs(Date.now());
-    setHistoryFeedback(null);
-    setFormFeedback({
-      kind: "success",
-      text: `Reservation ${ref} confirmed (demo): ${formPointId} at ${station.name}, ${formatDateTime(
-        startMs
-      )} to ${formatDateTime(endMs)}. Estimated ${formatNumber2(estimate.energyKWh)} kWh, ${formatINR(
-        estimate.cost
-      )}.`,
-    });
-    setForm((prev) => ({
-      ...prev,
-      stationId: station.id,
-      pointId: formPointId,
-      evId: ev.id,
-      start: "",
-      end: "",
-    }));
+    const startMs = parseLocal(form.start);
+    const endMs = parseLocal(form.end);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      setFormFeedback({ kind: "error", text: "Please enter valid start and end date/time values." });
+      return;
+    }
+    if (startMs <= Date.now()) {
+      setFormFeedback({ kind: "error", text: "The start time must be in the future." });
+      return;
+    }
+    if (endMs <= startMs) {
+      setFormFeedback({ kind: "error", text: "The end time must be later than the start time." });
+      return;
+    }
+    if (point.status !== "Available") {
+      setFormFeedback({
+        kind: "error",
+        text: "This charging point is no longer available. Refresh booking options and select another point.",
+      });
+      return;
+    }
+
+    setSubmitting(true);
+    setFormFeedback(null);
+    try {
+      const payload = await readApiResponse(
+        await fetch("/api/reservations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: vehicle.userId,
+            ev_id: vehicle.id,
+            point_id: point.id,
+            tariff_id: tariff.id,
+            start_time: new Date(startMs).toISOString(),
+            end_time: new Date(endMs).toISOString(),
+          }),
+        })
+      );
+      const reservationId = parseId(payload.reservation_id);
+      const historyRefreshed = await loadReservationHistory();
+      setHistoryFeedback(
+        historyRefreshed
+          ? null
+          : { kind: "error", text: "The reservation was saved, but history could not be refreshed." }
+      );
+      setFormFeedback({
+        kind: "success",
+        text: `Reservation #${reservationId} created successfully for ${point.id} at ${station.name}.`,
+      });
+      setForm((previous) => ({ ...previous, start: "", end: "" }));
+    } catch (error) {
+      setFormFeedback({
+        kind: "error",
+        text: error instanceof Error ? error.message : "Could not create the reservation. Please try again.",
+      });
+      void loadBookingOptions();
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  const cancelReservation = (ref: string) => {
-    const target = reservations.find((r) => r.ref === ref);
-    if (!target) {
-      setHistoryFeedback({ kind: "error", text: `Reservation ${ref} was not found.` });
+  const cancelReservation = async (id: number) => {
+    const target = apiReservations.find((reservation) => reservation.id === id);
+    if (!target || target.userId === null) {
+      setHistoryFeedback({ kind: "error", text: "This reservation cannot be cancelled by the current account." });
       return;
     }
-    if (target.status === "Cancelled") {
-      setHistoryFeedback({ kind: "error", text: `Reservation ${ref} is already cancelled.` });
-      return;
+    setCancellingId(id);
+    setHistoryFeedback(null);
+    try {
+      await readApiResponse(
+        await fetch("/api/reservations", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reservation_id: target.id, user_id: target.userId }),
+        })
+      );
+      const historyRefreshed = await loadReservationHistory();
+      setHistoryFeedback({
+        kind: historyRefreshed ? "success" : "error",
+        text: historyRefreshed
+          ? `Reservation #${target.id} cancelled successfully.`
+          : "The reservation was cancelled, but history could not be refreshed.",
+      });
+    } catch (error) {
+      setHistoryFeedback({
+        kind: "error",
+        text: error instanceof Error ? error.message : "Could not cancel the reservation. Please try again.",
+      });
+    } finally {
+      setCancellingId(null);
     }
-    setReservations((prev) =>
-      prev.map((r) => (r.ref === ref && r.status === "Confirmed" ? { ...r, status: "Cancelled" } : r))
-    );
-    setHistoryFeedback({
-      kind: "success",
-      text: `Reservation ${ref} cancelled. ${target.pointId} at ${target.stationName} is free again for that time.`,
-    });
   };
 
   /* EV handlers */
@@ -1861,7 +2361,10 @@ export default function Page() {
     return { ok: true, message: `Station "${target.name}" deleted (demo state only, not saved to MySQL).` };
   };
 
-  const liveCount = liveReservations.length;
+  const liveCount = apiReservations.filter(
+    (reservation) =>
+      ["Booked", "Confirmed"].includes(reservation.status) && reservation.endMs > nowMs
+  ).length;
 
   return (
     <div className="min-h-screen bg-slate-100 text-[#0f1b3d]">
@@ -1968,7 +2471,7 @@ export default function Page() {
             <p className="text-sm font-semibold text-amber-900">Demo mode</p>
           </div>
           <p className="mt-1 text-xs leading-relaxed text-amber-800">
-            Sample data only. Not connected to MySQL or MongoDB yet.
+            Reservations use MySQL APIs. Dashboard station cards and EV/admin tools still use demo data.
           </p>
         </div>
       </aside>
@@ -1981,38 +2484,46 @@ export default function Page() {
               stations={stations}
               availableByStation={availableByStation}
               totalAvailable={totalAvailable}
-              reservations={reservations}
+              reservations={apiReservations}
               liveCount={liveCount}
               nowMs={nowMs}
+              historyLoading={historyLoading}
+              historyError={historyError}
+              onRetryHistory={() => void loadReservationHistory()}
               onReserve={openReserve}
               onNavigate={go}
             />
           ) : null}
           {view === "stations" ? (
-            <StationsView stations={stations} availableByStation={availableByStation} onReserve={openReserve} />
+            <StationsView onReserve={openReserve} />
           ) : null}
           {view === "evs" ? (
             <EvsView evs={evs} liveReservations={liveReservations} onAdd={addEv} onDelete={deleteEv} />
           ) : null}
           {view === "reservations" ? (
             <ReservationsView
-              stations={stations}
-              evs={evs}
-              reservations={reservations}
+              stations={bookingStations}
+              vehicles={bookingVehicles}
+              reservations={apiReservations}
               form={form}
-              station={formStation}
-              pointId={formPointId}
-              ev={formEv}
               nowMs={nowMs}
               formFeedback={formFeedback}
               historyFeedback={historyFeedback}
+              optionsLoading={bookingOptionsLoading}
+              optionsError={bookingOptionsError}
+              historyLoading={historyLoading}
+              historyError={historyError}
+              submitting={submitting}
+              cancellingId={cancellingId}
               onStationChange={handleStationChange}
               onPointChange={handlePointChange}
+              onTariffChange={handleTariffChange}
               onFieldChange={updateForm}
               onQuickFill={handleQuickFill}
               onSubmit={submitReservation}
               onCancel={cancelReservation}
-              onNavigate={go}
+              onRetryOptions={() => void loadBookingOptions()}
+              onRetryHistory={() => void loadReservationHistory()}
             />
           ) : null}
           {view === "admin" ? (
@@ -2025,7 +2536,7 @@ export default function Page() {
           ) : null}
 
           <footer className="mt-10 border-t border-slate-200 pt-4 text-center text-xs text-slate-500">
-            VoltReserve · Smart EV Charging Station Reservation System · Frontend prototype with demo data
+            VoltReserve · Smart EV Charging Station Reservation System · MySQL-backed reservations
           </footer>
         </div>
       </main>
