@@ -51,6 +51,20 @@ interface ApiStation {
   chargingPoints: ApiChargingPoint[];
 }
 
+interface DashboardStation {
+  id: number;
+  name: string;
+  location: string;
+  city: string;
+  totalPoints: number;
+  availablePoints: number;
+  connectorTypes: string[];
+  minPowerKW: number | null;
+  maxPowerKW: number | null;
+  minTariffPerKWh: number | null;
+  maxTariffPerKWh: number | null;
+}
+
 interface Ev {
   id: string;
   number: string;
@@ -310,6 +324,41 @@ function parseStationsResponse(value: unknown): Omit<ApiStation, "chargingPoints
       name: parseText(row.station_name, "station name"),
       location: parseText(row.location, "station location"),
       city: parseText(row.city, "station city"),
+    };
+  });
+}
+
+function parseDashboardStationsResponse(value: unknown): DashboardStation[] {
+  if (!isRecord(value) || value.success !== true || !Array.isArray(value.data)) {
+    throw new Error("The stations API returned an invalid response.");
+  }
+
+  return value.data.map((row: unknown): DashboardStation => {
+    if (!isRecord(row)) throw new Error("The stations API returned an invalid station.");
+
+    const connectorTypes = row.connector_types;
+    if (connectorTypes !== null && typeof connectorTypes !== "string") {
+      throw new Error("The stations API returned invalid connector types.");
+    }
+
+    const nullableNumber = (field: unknown, name: string) =>
+      field === null || field === undefined ? null : parseNumber(field, name);
+
+    return {
+      id: parseId(row.station_id),
+      name: parseText(row.station_name, "station name"),
+      location: parseText(row.location, "station location"),
+      city: parseText(row.city, "station city"),
+      totalPoints: parseNumber(row.total_points, "total charging points"),
+      availablePoints: parseNumber(row.available_points, "available charging points"),
+      connectorTypes:
+        typeof connectorTypes === "string"
+          ? connectorTypes.split(",").map((type) => type.trim()).filter(Boolean)
+          : [],
+      minPowerKW: nullableNumber(row.min_power_kw, "minimum power rating"),
+      maxPowerKW: nullableNumber(row.max_power_kw, "maximum power rating"),
+      minTariffPerKWh: nullableNumber(row.min_rate_per_kwh, "minimum tariff"),
+      maxTariffPerKWh: nullableNumber(row.max_rate_per_kwh, "maximum tariff"),
     };
   });
 }
@@ -738,15 +787,28 @@ function DetailItem({ label, value }: { label: string; value: string }) {
 
 function StationCard({
   station,
-  available,
   onReserve,
 }: {
-  station: Station;
-  available: number;
+  station: DashboardStation;
   onReserve: (stationId: number) => void;
 }) {
-  const total = station.pointIds.length;
-  const pct = total > 0 ? Math.round((available / total) * 100) : 0;
+  const pct =
+    station.totalPoints > 0
+      ? Math.round((station.availablePoints / station.totalPoints) * 100)
+      : 0;
+  const power =
+    station.minPowerKW === null || station.maxPowerKW === null
+      ? "Not listed"
+      : station.minPowerKW === station.maxPowerKW
+        ? `${formatNumber2(station.minPowerKW)} kW`
+        : `${formatNumber2(station.minPowerKW)}-${formatNumber2(station.maxPowerKW)} kW`;
+  const tariff =
+    station.minTariffPerKWh === null || station.maxTariffPerKWh === null
+      ? "Not listed"
+      : station.minTariffPerKWh === station.maxTariffPerKWh
+        ? `₹${formatNumber2(station.minTariffPerKWh)}/kWh`
+        : `₹${formatNumber2(station.minTariffPerKWh)}-₹${formatNumber2(station.maxTariffPerKWh)}/kWh`;
+
   return (
     <article className={`${cardCls} flex flex-col p-5 transition hover:border-emerald-300 hover:shadow-md`}>
       <div className="flex items-start justify-between gap-3">
@@ -754,27 +816,40 @@ function StationCard({
           <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">📍 {station.city}</p>
           <h3 className="mt-1 text-lg font-semibold text-[#0f1b3d]">{station.name}</h3>
         </div>
-        <ConnectorBadge connector={station.connector} />
+      </div>
+      <p className="mt-1 text-sm text-slate-600">{station.location}</p>
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        {station.connectorTypes.length > 0 ? (
+          station.connectorTypes.map((connector) => (
+            <span
+              key={connector}
+              className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-200"
+            >
+              {connector}
+            </span>
+          ))
+        ) : (
+          <span className="text-xs text-slate-500">No connector details</span>
+        )}
       </div>
       <dl className="mt-4 grid grid-cols-2 gap-3">
-        <DetailItem label="Power" value={`${station.powerKW} kW`} />
-        <DetailItem label="Tariff" value={`₹${station.tariffPerKWh}/kWh`} />
+        <DetailItem label="Power range" value={power} />
+        <DetailItem label="Tariff range" value={tariff} />
       </dl>
       <div className="mt-4">
         <div className="flex items-center justify-between text-xs text-slate-600">
           <span>Charging points available</span>
           <span className="font-semibold text-[#0f1b3d]">
-            {available} of {total}
+            {station.availablePoints} of {station.totalPoints}
           </span>
         </div>
         <div
           className="mt-1.5 h-2 overflow-hidden rounded-full bg-slate-100"
           role="img"
-          aria-label={`${available} of ${total} charging points available`}
+          aria-label={`${station.availablePoints} of ${station.totalPoints} charging points available`}
         >
           <div className="h-full rounded-full bg-emerald-500" style={{ width: `${pct}%` }} />
         </div>
-        <p className="mt-2 truncate text-xs text-slate-500">{station.pointIds.join(" · ")}</p>
       </div>
       <button type="button" onClick={() => onReserve(station.id)} className={`${btnPrimary} mt-5 w-full`}>
         Reserve
@@ -840,32 +915,35 @@ function ReservationCard({
 
 function DashboardView({
   stations,
-  availableByStation,
-  totalAvailable,
+  stationsLoading,
+  stationsError,
   reservations,
   liveCount,
   nowMs,
   historyLoading,
   historyError,
+  onRetryStations,
   onRetryHistory,
   onReserve,
   onNavigate,
 }: {
-  stations: Station[];
-  availableByStation: Map<number, number>;
-  totalAvailable: number;
+  stations: DashboardStation[];
+  stationsLoading: boolean;
+  stationsError: string | null;
   reservations: ApiReservation[];
   liveCount: number;
   nowMs: number;
   historyLoading: boolean;
   historyError: string | null;
+  onRetryStations: () => void;
   onRetryHistory: () => void;
   onReserve: (stationId: number) => void;
   onNavigate: (view: View) => void;
 }) {
   const featured = stations.slice(0, 3);
   const recent = reservations.slice(0, 3);
-  const totalPoints = stations.reduce((sum, s) => sum + s.pointIds.length, 0);
+  const totalPoints = stations.reduce((sum, station) => sum + station.totalPoints, 0);
+  const totalAvailable = stations.reduce((sum, station) => sum + station.availablePoints, 0);
   const cancelled = reservations.filter((r) => r.status === "Cancelled").length;
 
   return (
@@ -895,16 +973,27 @@ function DashboardView({
       </section>
 
       <DemoNotice>
-        Station summary cards and My EV/admin tools use demo data. Booking options and reservation history are loaded
-        from MySQL.
+        My EV and Admin tools use demo data. Station details, booking options, and reservation history are loaded from
+        MySQL.
       </DemoNotice>
 
       <section aria-label="Statistics" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Charging stations" value={String(stations.length)} hint="Across all cities" icon="🏢" />
+        <StatCard
+          label="Charging stations"
+          value={stationsLoading || stationsError ? "—" : String(stations.length)}
+          hint={stationsLoading ? "Loading station data" : stationsError ? "Station data unavailable" : "Across all cities"}
+          icon="🏢"
+        />
         <StatCard
           label="Available charging points"
-          value={String(totalAvailable)}
-          hint={`${totalAvailable} of ${totalPoints} not held by an active booking`}
+          value={stationsLoading || stationsError ? "—" : String(totalAvailable)}
+          hint={
+            stationsLoading
+              ? "Loading station data"
+              : stationsError
+                ? "Station data unavailable"
+                : `${totalAvailable} of ${totalPoints} marked available`
+          }
           icon="🔌"
         />
         <StatCard
@@ -936,21 +1025,31 @@ function DashboardView({
             View all stations
           </button>
         </div>
-        {featured.length === 0 ? (
+        {stationsLoading ? (
+          <div role="status" className={`${cardCls} px-6 py-10 text-center text-sm text-slate-600`}>
+            Loading station data…
+          </div>
+        ) : stationsError ? (
           <EmptyState
-            icon="⚡"
-            title="No stations yet"
-            message="Add a station from the Admin page to see it featured here."
+            icon="⚠️"
+            title="Could not load stations"
+            message={stationsError}
             action={
-              <button type="button" onClick={() => onNavigate("admin")} className={btnPrimary}>
-                Go to Admin
+              <button type="button" onClick={onRetryStations} className={btnPrimary}>
+                Retry
               </button>
             }
+          />
+        ) : featured.length === 0 ? (
+          <EmptyState
+            icon="⚡"
+            title="No stations found"
+            message="There are no charging stations in the database yet."
           />
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {featured.map((s) => (
-              <StationCard key={s.id} station={s} available={availableByStation.get(s.id) ?? 0} onReserve={onReserve} />
+              <StationCard key={s.id} station={s} onReserve={onReserve} />
             ))}
           </div>
         )}
@@ -2013,6 +2112,9 @@ export default function Page() {
   const [nowMs, setNowMs] = useState<number>(0);
 
   const [stations, setStations] = useState<Station[]>(INITIAL_STATIONS);
+  const [dashboardStations, setDashboardStations] = useState<DashboardStation[]>([]);
+  const [dashboardStationsLoading, setDashboardStationsLoading] = useState<boolean>(true);
+  const [dashboardStationsError, setDashboardStationsError] = useState<string | null>(null);
   const [evs, setEvs] = useState<Ev[]>(INITIAL_EVS);
   const [reservations] = useState<Reservation[]>([]);
 
@@ -2038,6 +2140,22 @@ export default function Page() {
 
   const nextStationId = useRef<number>(5);
   const nextEvId = useRef<number>(4);
+
+  const loadDashboardStations = useCallback(async () => {
+    setDashboardStationsLoading(true);
+    setDashboardStationsError(null);
+    try {
+      const payload = await readApiResponse(await fetch("/api/stations"));
+      setDashboardStations(parseDashboardStationsResponse(payload));
+    } catch (error) {
+      setDashboardStations([]);
+      setDashboardStationsError(
+        error instanceof Error ? error.message : "Could not load station data. Please try again."
+      );
+    } finally {
+      setDashboardStationsLoading(false);
+    }
+  }, []);
 
   const loadBookingOptions = useCallback(async () => {
     setBookingOptionsLoading(true);
@@ -2091,6 +2209,10 @@ export default function Page() {
   }, [bookingVehicles]);
 
   useEffect(() => {
+    void Promise.resolve().then(loadDashboardStations);
+  }, [loadDashboardStations]);
+
+  useEffect(() => {
     void Promise.resolve().then(loadBookingOptions);
   }, [loadBookingOptions]);
 
@@ -2120,20 +2242,6 @@ export default function Page() {
   const liveReservations = useMemo(
     () => reservations.filter((r) => isLive(r, nowMs)),
     [reservations, nowMs]
-  );
-
-  const availableByStation = useMemo(() => {
-    const map = new Map<number, number>();
-    for (const s of stations) {
-      const held = new Set(liveReservations.filter((r) => r.stationId === s.id).map((r) => r.pointId));
-      map.set(s.id, s.pointIds.filter((p) => !held.has(p)).length);
-    }
-    return map;
-  }, [stations, liveReservations]);
-
-  const totalAvailable = useMemo(
-    () => Array.from(availableByStation.values()).reduce((sum, n) => sum + n, 0),
-    [availableByStation]
   );
 
   /* Navigation */
@@ -2471,7 +2579,7 @@ export default function Page() {
             <p className="text-sm font-semibold text-amber-900">Demo mode</p>
           </div>
           <p className="mt-1 text-xs leading-relaxed text-amber-800">
-            Reservations use MySQL APIs. Dashboard station cards and EV/admin tools still use demo data.
+            My EV and Admin tools still use demo data. Stations and reservations use MySQL.
           </p>
         </div>
       </aside>
@@ -2481,14 +2589,15 @@ export default function Page() {
         <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
           {view === "dashboard" ? (
             <DashboardView
-              stations={stations}
-              availableByStation={availableByStation}
-              totalAvailable={totalAvailable}
+              stations={dashboardStations}
+              stationsLoading={dashboardStationsLoading}
+              stationsError={dashboardStationsError}
               reservations={apiReservations}
               liveCount={liveCount}
               nowMs={nowMs}
               historyLoading={historyLoading}
               historyError={historyError}
+              onRetryStations={() => void loadDashboardStations()}
               onRetryHistory={() => void loadReservationHistory()}
               onReserve={openReserve}
               onNavigate={go}
