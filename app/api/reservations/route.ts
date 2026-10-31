@@ -1,12 +1,34 @@
-import { logActivity } from "@/lib/mongodb";
+
+import { verifySession } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import pool from "@/lib/db";
 
-export async function GET() {
+async function getAuthenticatedUser(request: NextRequest) {
+  const token = request.cookies.get("session")?.value;
+
+  if (!token) {
+    return null;
+  }
+
+  return verifySession(token);
+}
+
+// GET: Customers can view their own reservations; admins can view all.
+export async function GET(request: NextRequest) {
   try {
-    const [rows] = await pool.query(`
+    const user = await getAuthenticatedUser(request);
+
+    if (!user) {
+      return NextResponse.json(
+        { success: false, message: "Authentication required" },
+        { status: 401 }
+      );
+    }
+
+    const query = `
       SELECT
         r.reservation_id,
+        r.user_id,
         r.start_time,
         r.end_time,
         r.status,
@@ -24,8 +46,14 @@ export async function GET() {
       JOIN evs e ON r.ev_id = e.ev_id
       JOIN charging_points cp ON r.point_id = cp.point_id
       JOIN charging_stations cs ON cp.station_id = cs.station_id
+      ${user.role === "admin" ? "" : "WHERE r.user_id = ?"}
       ORDER BY r.start_time ASC
-    `);
+    `;
+
+    const [rows] =
+      user.role === "admin"
+        ? await pool.query(query)
+        : await pool.query(query, [user.userId]);
 
     return NextResponse.json({
       success: true,
@@ -35,25 +63,31 @@ export async function GET() {
     console.error("Reservations API error:", error);
 
     return NextResponse.json(
-      {
-        success: false,
-        message: "Failed to fetch reservations",
-      },
-      { status: 500 },
+      { success: false, message: "Failed to fetch reservations" },
+      { status: 500 }
     );
   }
 }
 
+// POST: Create a reservation for the authenticated user.
 export async function POST(request: NextRequest) {
   let connection;
+  let transactionStarted = false;
 
   try {
-    const body = await request.json();
+    const user = await getAuthenticatedUser(request);
 
-    const { user_id, ev_id, point_id, tariff_id, start_time, end_time } = body;
+    if (!user) {
+      return NextResponse.json(
+        { success: false, message: "Authentication required" },
+        { status: 401 }
+      );
+    }
+
+    const body = await request.json();
+    const { ev_id, point_id, tariff_id, start_time, end_time } = body;
 
     if (
-      !Number.isInteger(user_id) ||
       !Number.isInteger(ev_id) ||
       !Number.isInteger(point_id) ||
       !Number.isInteger(tariff_id) ||
@@ -61,11 +95,8 @@ export async function POST(request: NextRequest) {
       typeof end_time !== "string"
     ) {
       return NextResponse.json(
-        {
-          success: false,
-          message: "Invalid or missing reservation fields",
-        },
-        { status: 400 },
+        { success: false, message: "Invalid or missing reservation fields" },
+        { status: 400 }
       );
     }
 
@@ -78,33 +109,29 @@ export async function POST(request: NextRequest) {
       end <= start
     ) {
       return NextResponse.json(
-        {
-          success: false,
-          message: "End time must be after start time",
-        },
-        { status: 400 },
+        { success: false, message: "End time must be after start time" },
+        { status: 400 }
       );
     }
 
     if (start <= new Date()) {
       return NextResponse.json(
-        {
-          success: false,
-          message: "Reservation must be in the future",
-        },
-        { status: 400 },
+        { success: false, message: "Reservation must be in the future" },
+        { status: 400 }
       );
     }
 
     connection = await pool.getConnection();
     await connection.beginTransaction();
+    transactionStarted = true;
 
+    // Lock the charging point while validating and creating the reservation.
     const [points] = await connection.query(
       `SELECT station_id, status
        FROM charging_points
        WHERE point_id = ?
        FOR UPDATE`,
-      [point_id],
+      [point_id]
     );
 
     const pointRows = points as {
@@ -114,25 +141,21 @@ export async function POST(request: NextRequest) {
 
     if (pointRows.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        {
-          success: false,
-          message: "Charging point not found",
-        },
-        { status: 404 },
+        { success: false, message: "Charging point not found" },
+        { status: 404 }
       );
     }
 
     if (pointRows[0].status !== "Available") {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        {
-          success: false,
-          message: "Charging point is not available",
-        },
-        { status: 409 },
+        { success: false, message: "Charging point is not available" },
+        { status: 409 }
       );
     }
 
@@ -140,55 +163,42 @@ export async function POST(request: NextRequest) {
       `SELECT tariff_id
        FROM tariff_plans
        WHERE tariff_id = ? AND station_id = ?`,
-      [tariff_id, pointRows[0].station_id],
+      [tariff_id, pointRows[0].station_id]
     );
 
     if ((tariffs as unknown[]).length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
           success: false,
           message: "Tariff does not belong to the selected station",
         },
-        { status: 400 },
+        { status: 400 }
       );
     }
 
-    const [users] = await connection.query(
-      "SELECT user_id FROM users WHERE user_id = ?",
-      [user_id],
-    );
-
-    if ((users as unknown[]).length === 0) {
-      await connection.rollback();
-
-      return NextResponse.json(
-        {
-          success: false,
-          message: "User not found",
-        },
-        { status: 404 },
-      );
-    }
-
+    // Never trust a user_id supplied by the browser.
     const [vehicles] = await connection.query(
       "SELECT ev_id FROM evs WHERE ev_id = ? AND user_id = ?",
-      [ev_id, user_id],
+      [ev_id, user.userId]
     );
 
     if ((vehicles as unknown[]).length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
           success: false,
-          message: "Vehicle not found for this user",
+          message: "Vehicle not found for the authenticated user",
         },
-        { status: 400 },
+        { status: 403 }
       );
     }
 
+    // Reject overlapping active reservations for the same charging point.
     const [conflicts] = await connection.query(
       `SELECT reservation_id
        FROM reservations
@@ -198,18 +208,19 @@ export async function POST(request: NextRequest) {
          AND end_time > ?
        LIMIT 1
        FOR UPDATE`,
-      [point_id, end, start],
+      [point_id, end, start]
     );
 
     if ((conflicts as unknown[]).length > 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
           success: false,
           message: "Charging point is already reserved for that time slot",
         },
-        { status: 409 },
+        { status: 409 }
       );
     }
 
@@ -217,33 +228,13 @@ export async function POST(request: NextRequest) {
       `INSERT INTO reservations
         (user_id, ev_id, point_id, tariff_id, start_time, end_time, status)
        VALUES (?, ?, ?, ?, ?, ?, 'Booked')`,
-      [user_id, ev_id, point_id, tariff_id, start, end],
+      [user.userId, ev_id, point_id, tariff_id, start, end]
     );
-
-    await connection.commit();
 
     const insertResult = result as { insertId: number };
 
-    try {
-      await logActivity({
-        action: "reservation.created",
-        userId: user_id,
-        entityType: "reservation",
-        entityId: insertResult.insertId,
-        metadata: {
-          pointId: point_id,
-          evId: ev_id,
-          tariffId: tariff_id,
-          startTime: start.toISOString(),
-          endTime: end.toISOString(),
-        },
-      });
-    } catch (activityError) {
-      console.error(
-        "Reservation saved in MySQL, but MongoDB logging failed:",
-        activityError,
-      );
-    }
+    await connection.commit();
+    transactionStarted = false;
 
     return NextResponse.json(
       {
@@ -251,53 +242,63 @@ export async function POST(request: NextRequest) {
         message: "Reservation created successfully",
         reservation_id: insertResult.insertId,
       },
-      { status: 201 },
+      { status: 201 }
     );
   } catch (error) {
-    if (connection) {
-      await connection.rollback();
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Reservation rollback failed:", rollbackError);
+      }
     }
 
     console.error("Create reservation API error:", error);
 
     return NextResponse.json(
-      {
-        success: false,
-        message: "Failed to create reservation",
-      },
-      { status: 500 },
+      { success: false, message: "Failed to create reservation" },
+      { status: 500 }
     );
   } finally {
     connection?.release();
   }
 }
 
+// DELETE: A customer can cancel only their own active reservation.
 export async function DELETE(request: NextRequest) {
   let connection;
+  let transactionStarted = false;
 
   try {
-    const body = await request.json();
-    const { reservation_id, user_id } = body;
+    const user = await getAuthenticatedUser(request);
 
-    if (!Number.isInteger(reservation_id) || !Number.isInteger(user_id)) {
+    if (!user) {
       return NextResponse.json(
-        {
-          success: false,
-          message: "Valid reservation_id and user_id are required",
-        },
-        { status: 400 },
+        { success: false, message: "Authentication required" },
+        { status: 401 }
+      );
+    }
+
+    const body = await request.json();
+    const { reservation_id } = body;
+
+    if (!Number.isInteger(reservation_id)) {
+      return NextResponse.json(
+        { success: false, message: "Valid reservation_id is required" },
+        { status: 400 }
       );
     }
 
     connection = await pool.getConnection();
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [rows] = await connection.query(
       `SELECT reservation_id, status
        FROM reservations
        WHERE reservation_id = ? AND user_id = ?
        FOR UPDATE`,
-      [reservation_id, user_id],
+      [reservation_id, user.userId]
     );
 
     const reservations = rows as {
@@ -307,25 +308,21 @@ export async function DELETE(request: NextRequest) {
 
     if (reservations.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        {
-          success: false,
-          message: "Reservation not found for this user",
-        },
-        { status: 404 },
+        { success: false, message: "Reservation not found for this user" },
+        { status: 404 }
       );
     }
 
     if (!["Booked", "Confirmed"].includes(reservations[0].status)) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        {
-          success: false,
-          message: "This reservation cannot be cancelled",
-        },
-        { status: 409 },
+        { success: false, message: "This reservation cannot be cancelled" },
+        { status: 409 }
       );
     }
 
@@ -333,42 +330,30 @@ export async function DELETE(request: NextRequest) {
       `UPDATE reservations
        SET status = 'Cancelled'
        WHERE reservation_id = ? AND user_id = ?`,
-      [reservation_id, user_id],
+      [reservation_id, user.userId]
     );
 
     await connection.commit();
-
-    try {
-      await logActivity({
-        action: "reservation.cancelled",
-        userId: user_id,
-        entityType: "reservation",
-        entityId: reservation_id,
-      });
-    } catch (activityError) {
-      console.error(
-        "Reservation cancelled in MySQL, but MongoDB logging failed:",
-        activityError,
-      );
-    }
+    transactionStarted = false;
 
     return NextResponse.json({
       success: true,
       message: "Reservation cancelled successfully",
     });
   } catch (error) {
-    if (connection) {
-      await connection.rollback();
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Cancellation rollback failed:", rollbackError);
+      }
     }
 
     console.error("Cancel reservation API error:", error);
 
     return NextResponse.json(
-      {
-        success: false,
-        message: "Failed to cancel reservation",
-      },
-      { status: 500 },
+      { success: false, message: "Failed to cancel reservation" },
+      { status: 500 }
     );
   } finally {
     connection?.release();
