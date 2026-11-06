@@ -27,11 +27,11 @@ VALUES
      12.9750000, 77.6060000);
 
 INSERT INTO charging_points
-    (station_id, connector_type, power_kw, status)
+    (station_id, point_code, connector_type, power_kw, status)
 VALUES
-    (1, 'CCS2', 50.00, 'Available'),
-    (1, 'Type 2', 22.00, 'Available'),
-    (2, 'CCS2', 60.00, 'Available');
+    (1, 'PES-01', 'CCS2', 50.00, 'Available'),
+    (1, 'PES-02', 'Type 2', 22.00, 'Available'),
+    (2, 'MGR-01', 'CCS2', 60.00, 'Available');
 
 INSERT INTO tariff_plans
     (station_id, rate_per_kwh)

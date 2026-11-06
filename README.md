@@ -1,33 +1,48 @@
 # Smart EV Charging Station Reservation System
 
-A DBMS mini project by Sriniket Deeduvanu and Surya R Naik. The application uses Next.js for its frontend and API routes, MySQL for reservation data, and MongoDB for reservation activity logs.
+A DBMS Experiential Learning Level 3 project by Sriniket Deeduvanu and Surya R Naik. It uses Next.js for the web interface and API layer, MySQL for relational booking data, and MongoDB for activity events.
 
-## Current features
+## Implemented functionality
 
-- Browse booking options from MySQL, including EVs, available charging points, station information, and tariffs.
-- Create, cancel, and view reservation history using MySQL.
-- Record reservation creation and cancellation events in MongoDB's `activity_logs` collection.
-- Explore advanced MySQL examples in [`db/advanced_queries.sql`](./db/advanced_queries.sql), including the `advanced_reservation_details` view and two tested MySQL 8 triggers that prevent overlapping active reservations on the same charging point.
+- Customer registration and login using bcrypt password hashes and signed server-managed sessions, with in-app account details and logout.
+- My EV: authenticated, MySQL-backed vehicle listing, registration, editing and deletion.
+- EV validation, duplicate registration protection, owner-scoped updates and deletion protection for vehicles referenced by reservation history.
+- MySQL-backed booking options and reservation history.
+- Reservation creation and cancellation with server-side ownership and time validation.
+- Charging-point locking and overlapping active-reservation checks.
+- A pending payment record is inserted in the same MySQL transaction as a new reservation. Its amount is initialized to zero until a simulated charging session finalizes it; no real payment gateway is integrated.
+- MongoDB activity events for successful login, reservation creation/cancellation, and station creation/update/deletion.
+- Authenticated activity-log retrieval and an Activity screen. Customers see their own events; administrators can inspect the full audit stream.
+- Admin-only MySQL station and charging-point management with unique human-readable point codes and reservation-history protection.
+- An advanced SQL demonstration script, a reservation-details view, overlap-prevention triggers and reservation indexes.
 
-The `db/advanced_queries.sql` script includes an advanced reservation
-view, two overlap-prevention triggers, SQL query examples, and a
-temporary-table transaction demonstration. Executing the relevant
-statements creates the view and triggers in MySQL. Optional ALTER
-and DROP VIEW examples remain commented out. Review and deliberately enable those statements if you want to create the database objects.
+## Technology stack
 
-## Technology
+- Next.js App Router, React, TypeScript and Tailwind CSS
+- MySQL 8 / InnoDB through `mysql2`
+- MongoDB through the official Node.js driver
+- bcrypt password hashing and signed session cookies
+- Git and GitHub
 
-- Next.js, React, and TypeScript
-- MySQL 8 with InnoDB
-- MongoDB (a local MongoDB instance is used in development)
+## Database responsibilities
 
-The MySQL schema contains `users`, `evs`, `charging_stations`, `charging_points`, `tariff_plans`, `reservations`, `charging_sessions`, and `payments`. The seed script adds demonstration records.
+**MySQL** stores users, EVs, charging stations, charging points, tariff plans, reservations, charging sessions and payments. These records need relational integrity, joins, constraints and transactions.
+
+**MongoDB** stores flexible activity documents in the `activity_logs` collection. The collection demonstrates a second database paradigm through event insertion, indexes, filtered retrieval and aggregation.
+
+See:
+- [ER diagram](./docs/er-diagram.md)
+- [Architecture and data flow](./docs/architecture.md)
+- [MongoDB data model](./docs/mongodb-data-model.md)
+- [Test cases and verification status](./docs/test-cases.md)
+- [Project overview, objectives and conclusion](./docs/project-overview.md)
+- [Data dictionary](./docs/data-dictionary.md)
 
 ## Requirements
 
 - Node.js and npm
 - MySQL 8
-- MongoDB running locally for development
+- MongoDB Atlas or a local MongoDB instance
 
 ## Setup
 
@@ -38,44 +53,73 @@ The MySQL schema contains `users`, `evs`, `charging_stations`, `charging_points`
    cd smart-ev-charging-reservation
    ```
 
-2. Before running [`db/schema.sql`](./db/schema.sql), inspect the script. It contains `DROP TABLE` statements that remove existing tables and their data. Run it only after confirming that resetting the target database is safe.
+2. Create the database schema. **Warning:** `db/schema.sql` contains `DROP TABLE` statements and removes existing project data. Inspect it and run it only against a development database when a reset is intended.
 
-3. Using a MySQL client, run `db/schema.sql`, then run `db/seed.sql` to add the sample records. The schema creates and uses the `smart_ev_charging_test` database.
+   If you already have a working project database with data you need to keep, **do not run `db/schema.sql`**. Run only the point-code migration below against that existing database.
 
-4. Create `.env.local` in the project root and configure the database connections. Replace placeholders with values for your local setup; do not commit real passwords or other credentials.
+   ```sh
+   mysql -u YOUR_MYSQL_USER -p < db/schema.sql
+   # For an existing database created before charging-point codes were added, run this migration once:
+   mysql -u YOUR_MYSQL_USER -p smart_ev_charging_test < db/migrations/20261106_add_charging_point_code.sql
+
+   mysql -u YOUR_MYSQL_USER -p smart_ev_charging_test < db/seed.sql
+   mysql -u YOUR_MYSQL_USER -p smart_ev_charging_test < db/views.sql
+   mysql -u YOUR_MYSQL_USER -p smart_ev_charging_test < db/triggers.sql
+   mysql -u YOUR_MYSQL_USER -p smart_ev_charging_test < db/advanced_queries.sql
+   ```
+
+   The seed file includes placeholder bcrypt hashes for demo accounts. Register a real test account through the application, or replace the placeholder hashes with valid hashes before trying to log in with seeded users.
+
+3. Copy `.env.example` to `.env.local` and update the values for your local environment. Never commit `.env.local` or real credentials.
 
    ```dotenv
    DB_HOST=127.0.0.1
    DB_PORT=3306
-   DB_USER=<YOUR_MYSQL_USER>
-   DB_PASSWORD=<YOUR_MYSQL_PASSWORD>
+   DB_USER=YOUR_MYSQL_USER
+   DB_PASSWORD=YOUR_MYSQL_PASSWORD
    DB_NAME=smart_ev_charging_test
-   MONGODB_URI=mongodb://<LOCAL_MONGODB_HOST>:<LOCAL_MONGODB_PORT>
+   SESSION_SECRET=replace_with_a_long_random_secret
+   MONGODB_URI=mongodb://127.0.0.1:27017
    MONGODB_DB=smart_ev
    ```
 
-   Start MongoDB locally before using features that write or read activity logs.
+   For MongoDB Atlas, use the Atlas connection URI for `MONGODB_URI`. Use a long, private random value for `SESSION_SECRET`.
 
-5. Install dependencies and start the development server:
+4. Install dependencies and start the application:
 
    ```sh
    npm install
    npm run dev
    ```
 
-   Open [http://localhost:3000](http://localhost:3000).
+   Open [http://localhost:3000](http://localhost:3000). Sign in or create an account at `/login`; the main screen shows the current account and provides an in-app sign-out control.
 
-## API endpoints
+## Main API routes
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/api/db-test` | Check the MySQL connection. |
-| `GET` | `/api/stations` | Return charging stations from MySQL. |
-| `GET` | `/api/booking-options` | Load vehicles and available charging points with station and tariff details from MySQL. |
-| `GET` | `/api/reservations` | Return reservation history from MySQL. |
-| `POST` | `/api/reservations` | Validate and create a reservation in MySQL; log its creation in MongoDB. |
-| `DELETE` | `/api/reservations` | Cancel an eligible reservation in MySQL; log its cancellation in MongoDB. |
-| `GET` | `/api/activity-logs` | Return recent MongoDB reservation activity logs. |
+| `POST` | `/api/auth/register` | Register a customer |
+| `POST` | `/api/auth/login` | Verify credentials and create a session |
+| `GET` | `/api/auth/session` | Return the signed-in user's account details and validate the current role |
+| `POST` | `/api/auth/logout` | Clear the session cookie and sign out |
+| `GET` | `/api/stations` | Read station summaries from MySQL |
+| `GET`, `POST`, `PATCH`, `DELETE` | `/api/admin/stations` | Admin-only station and charging-point management; changes are transactional and persisted in MySQL |
+| `GET` | `/api/booking-options` | Load the signed-in user's EVs and available booking options |
+| `GET`, `POST`, `PATCH`, `DELETE` | `/api/evs` | List, register, edit and delete the signed-in user's EVs |
+| `GET` | `/api/reservations` | Read allowed reservation history |
+| `POST` | `/api/reservations` | Create a reservation and pending payment in one MySQL transaction |
+| `DELETE` | `/api/reservations` | Cancel an eligible reservation |
+| `GET` | `/api/activity-logs` | Read recent MongoDB activity for the signed-in user (or all events for an admin) |
+
+## SQL and MongoDB demonstrations
+
+- `db/schema.sql`: relational tables, primary/foreign keys, checks and indexes.
+- `db/advanced_queries.sql`: safe temporary-table DDL examples, rollback-protected DML examples, joins, grouping, HAVING, aggregates, a subquery and index inspection.
+- `db/views.sql`: creates `advanced_reservation_details`.
+- `db/triggers.sql`: prevents overlapping active reservations during insert and update.
+- `db/mongodb_activity_aggregation.js`: groups activity events by action and counts them.
+
+Run the SQL scripts against a disposable development database first. The DML demonstration in `advanced_queries.sql` rolls back its test inserts and deletes.
 
 ## Development checks
 
@@ -86,12 +130,14 @@ npm run build
 
 ## Current limitations
 
-- Dashboard station cards still use demo data; the stations API exists, but those cards are not currently MySQL-backed.
-- My EV and admin tools use in-memory demo data and do not persist their changes to MySQL.
-- Booking options and reservation history use MySQL.
-- Authentication and payment processing are not fully implemented. The current reservation flow uses the demonstration user with `user_id` 1; do not treat it as production account authorization.
+- Station name, location, point-count and connector/power values are persisted; the current tariff is updated in place, so the schema does not keep an immutable historical tariff snapshot for each reservation.
+- Payment is simulated. The pending payment row is created with amount zero and no payment gateway is connected.
+- Charging sessions are demonstration records; physical charging hardware is out of scope.
+- Activity events currently cover login, reservation creation/cancellation, and admin station creation/update/deletion.
 
 ## Team
 
-- Sriniket Deeduvanu - PES2UG24CS521
-- Surya R Naik - PES2UG24CS540
+- Sriniket Deeduvanu — database design, SQL implementation and core backend integration.
+- Surya R Naik — Next.js interface, frontend workflows, MongoDB activity logs and UI integration.
+
+Both members contribute to integration, testing, documentation and the final demonstration.

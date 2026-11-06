@@ -1,5 +1,5 @@
 // Smart EV Reservation System
-// MongoDB aggregation: count reservation activity by action
+// MongoDB aggregation: count application activity events by action
 
 // Select database: smart_ev
 
