@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import pool from "@/lib/db";
 import { createSession } from "@/lib/auth";
+import { logActivity } from "@/lib/mongodb";
 import type { RowDataPacket } from "mysql2";
 
 type UserRow = RowDataPacket & {
@@ -56,6 +57,19 @@ export async function POST(request: NextRequest) {
       userId: user.user_id,
       role: user.role,
     });
+
+    // Activity logging is best-effort: MongoDB outages must not block login.
+    try {
+      await logActivity({
+        action: "auth.login",
+        userId: user.user_id,
+        entityType: "user",
+        entityId: user.user_id,
+        metadata: { role: user.role },
+      });
+    } catch (logError) {
+      console.error("Failed to log login activity:", logError);
+    }
 
     const response = NextResponse.json({
       success: true,

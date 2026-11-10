@@ -234,6 +234,16 @@ export async function POST(request: NextRequest) {
 
     const insertResult = result as { insertId: number };
 
+    // Create the pending payment in the same transaction as the reservation.
+    // The amount stays at zero until a simulated charging session finalizes it;
+    // this project does not process real payments.
+    await connection.query(
+      `INSERT INTO payments
+        (reservation_id, amount, payment_method, payment_status)
+       VALUES (?, 0.00, 'Demo / pending', 'Pending')`,
+      [insertResult.insertId]
+    );
+
     await connection.commit();
     transactionStarted = false;
 

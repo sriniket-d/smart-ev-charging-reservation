@@ -32,13 +32,17 @@ export async function getMongoDb(): Promise<Db> {
 }
 
 export type ActivityAction =
+  | "auth.login"
   | "reservation.created"
-  | "reservation.cancelled";
+  | "reservation.cancelled"
+  | "station.created"
+  | "station.updated"
+  | "station.deleted";
 
 export interface ActivityInput {
   action: ActivityAction;
   userId: number;
-  entityType: "reservation";
+  entityType: "user" | "reservation" | "station";
   entityId: number;
   metadata?: Record<string, string | number | boolean | null>;
 }
@@ -50,6 +54,11 @@ export async function logActivity(input: ActivityInput): Promise<void> {
   await collection.createIndex(
     { timestamp: -1 },
     { name: "idx_activity_logs_timestamp" }
+  );
+
+  await collection.createIndex(
+    { userId: 1, timestamp: -1 },
+    { name: "idx_activity_logs_user_timestamp" }
   );
 
   await collection.createIndex(

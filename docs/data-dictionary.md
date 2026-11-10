@@ -102,6 +102,8 @@ Stores individual charging points at stations.
 
 | point\_id | INT | Primary key, auto-increment | Unique charging point identifier |
 
+| point\_code | VARCHAR(20) | UNIQUE, NOT NULL | Human-readable charging-point code, such as PES-01 |
+
 | station\_id | INT | Foreign key, NOT NULL | Parent station |
 
 | connector\_type | VARCHAR(50) | NOT NULL | Supported connector |

@@ -60,12 +60,14 @@ CREATE TABLE charging_stations (
 
 CREATE TABLE charging_points (
     point_id INT AUTO_INCREMENT PRIMARY KEY,
+    point_code VARCHAR(20) NOT NULL,
     station_id INT NOT NULL,
     connector_type VARCHAR(50) NOT NULL,
     power_kw DECIMAL(6,2) NOT NULL,
     status ENUM('Available', 'Occupied', 'Unavailable', 'Maintenance')
         NOT NULL DEFAULT 'Available',
     CONSTRAINT chk_point_power CHECK (power_kw > 0),
+    CONSTRAINT uq_charging_points_point_code UNIQUE (point_code),
     CONSTRAINT fk_points_station FOREIGN KEY (station_id)
         REFERENCES charging_stations(station_id)
         ON UPDATE CASCADE ON DELETE RESTRICT
