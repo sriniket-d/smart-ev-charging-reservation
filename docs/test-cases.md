@@ -25,7 +25,7 @@ Retain screenshots or SQL query output for these checks in the final submission.
 |---|---|---|---|
 | AUTH-02 | Register a new customer | Registration succeeds and the UI shows the success state | Pending re-check |
 | AUTH-03 | Sign out from the main application sidebar | Session cookie is cleared and the user is returned to the sign-in/create-account page | Passed manually; logout API returned HTTP 200 and redirected to `/login` |
-| AUTH-04 | Change a user's MySQL role while an old session exists | Session endpoint clears the stale session; signing in again issues the updated role | Pending |
+| AUTH-04 | Change a user's MySQL role while an old session exists | Protected endpoints reject the old session; signing in again issues the updated role | Pending |
 | AUTH-05 | Load the main application with no session | Sidebar offers Sign in / Create account; protected API calls remain unauthorized | Pending |
 | ACT-01 | Call activity-log endpoint without a session | HTTP 401; no activity data returned | Pending |
 | ACT-02 | Customer retrieves activity | Only that customer's events are returned | Passed manually; customer user ID 4 returned only user ID 4 events; console check `Only own activity: true` |
@@ -46,6 +46,46 @@ Retain screenshots or SQL query output for these checks in the final submission.
 | ADMIN-06 | Admin deletes a station with reservation history | API rejects deletion with HTTP 409 | Passed manually; UI displayed the reservation-history protection error and retained the station |
 | ADMIN-07 | Admin deletes a station with no reservation history | Points, tariff and station are removed in one transaction | Passed manually; UI confirmed successful deletion and station count decreased from 3 to 2 |
 | ADMIN-08 | Admin submits duplicate point codes | API rejects the request with HTTP 409 and rolls back all inserts | Pending |
+
+## Session role and deleted-account regression checks
+
+These checks cover the database-backed role validation shared by protected API
+routes. Run them only against a disposable local database with test accounts.
+Do not use a shared or production account. Results below have not been executed
+in this update.
+
+| Check | Steps | Expected result | Status |
+|---|---|---|---|
+| Current admin access | Sign in as a test admin, save the session cookie, then call `GET /api/admin/stations`. | HTTP 200 with station-management data. | Not run in this update |
+| Demoted admin's old cookie | Using that cookie, change only the test account's MySQL role to `customer`. Call `GET /api/admin/stations` and try a station mutation; also call `GET /api/activity-logs` and `GET /api/reservations`. | The old session is rejected with HTTP 401 and cleared. No admin mutation occurs and no all-user activity or reservation data is returned. | Not run in this update |
+| Refreshed customer permissions | Sign in again after demotion. Call `GET /api/admin/stations`, `GET /api/activity-logs` and `GET /api/reservations`. | Admin access returns HTTP 403; activity contains only that customer's events and reservation history contains only that customer's rows. | Not run in this update |
+| Deleted account's old cookie | Create a test account without related records, sign in, delete that test account directly from MySQL, then call protected APIs such as `/api/evs`, `/api/booking-options`, `/api/reservations` and `/api/activity-logs` with the saved cookie. | Each request returns HTTP 401, clears the stale cookie, and returns no protected data. | Not run in this update |
+
+For the role-change step, substitute the test account's unique email:
+
+```sql
+UPDATE users
+SET role = 'customer'
+WHERE email = 'your-test-admin-email@example.com';
+```
+
+For deletion, use a separate account with no EVs or other dependent records:
+
+```sql
+DELETE FROM users
+WHERE email = 'your-disposable-test-email@example.com';
+```
+
+Record observed HTTP statuses, response bodies, cookie-clearing headers and
+database state before changing any test status from “Not run”.
+
+## Verification performed in this update
+
+| Check | Result | Evidence |
+|---|---|---|
+| `npm run lint` | Passed | ESLint completed without reported errors. |
+| `npm run build` | Passed | Next.js production build and TypeScript checks completed; protected API routes were generated as dynamic routes. |
+| Role-change, deleted-account and access-scope API scenarios | Not run | These require a disposable MySQL test database and live session cookies; no runtime account or database changes were made. |
 
 ## Local setup for admin verification
 

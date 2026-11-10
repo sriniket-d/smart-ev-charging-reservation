@@ -1,8 +1,8 @@
-import { verifySession } from "@/lib/auth";
 import pool from "@/lib/db";
 import type { PoolConnection } from "mysql2/promise";
 import type { ResultSetHeader, RowDataPacket } from "mysql2";
 import { NextRequest, NextResponse } from "next/server";
+import { getAuthenticatedUser } from "@/lib/server-auth";
 
 type EvInput = {
   vehicleNumber: string;
@@ -10,11 +10,6 @@ type EvInput = {
   batteryCapacity: number;
   connectorType: "CCS2" | "Type 2";
 };
-
-async function getAuthenticatedUser(request: NextRequest) {
-  const token = request.cookies.get("session")?.value;
-  return token ? verifySession(token) : null;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -89,13 +84,6 @@ function isDatabaseError(error: unknown, code: string): boolean {
   );
 }
 
-function authenticationRequired() {
-  return NextResponse.json(
-    { success: false, message: "Authentication required or session expired." },
-    { status: 401 }
-  );
-}
-
 function duplicateVehicleNumber() {
   return NextResponse.json(
     { success: false, message: "A vehicle with this registration number already exists." },
@@ -104,10 +92,11 @@ function duplicateVehicleNumber() {
 }
 
 export async function GET(request: NextRequest) {
-  try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) return authenticationRequired();
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
 
+  try {
     const [vehicles] = await pool.query<RowDataPacket[]>(
       `SELECT ev_id, vehicle_number, model, battery_capacity, connector_type
        FROM evs
@@ -127,10 +116,11 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) return authenticationRequired();
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
 
+  try {
     const input = validateEvInput(await readBody(request));
     if (typeof input === "string") {
       return NextResponse.json({ success: false, message: input }, { status: 400 });
@@ -167,10 +157,11 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest) {
-  try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) return authenticationRequired();
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
 
+  try {
     const body = await readBody(request);
     const evId = parseEvId(body?.ev_id);
     if (evId === null) {
@@ -224,13 +215,14 @@ export async function PATCH(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
+
   let connection: PoolConnection | undefined;
   let transactionStarted = false;
 
   try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) return authenticationRequired();
-
     const body = await readBody(request);
     const evId = parseEvId(body?.ev_id);
     if (evId === null) {

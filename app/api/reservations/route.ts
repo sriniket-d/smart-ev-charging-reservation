@@ -1,31 +1,16 @@
 
-import { verifySession } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import pool from "@/lib/db";
 import { logActivity } from "@/lib/mongodb";
-
-async function getAuthenticatedUser(request: NextRequest) {
-  const token = request.cookies.get("session")?.value;
-
-  if (!token) {
-    return null;
-  }
-
-  return verifySession(token);
-}
+import { getAuthenticatedUser } from "@/lib/server-auth";
 
 // GET: Customers can view their own reservations; admins can view all.
 export async function GET(request: NextRequest) {
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
+
   try {
-    const user = await getAuthenticatedUser(request);
-
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "Authentication required" },
-        { status: 401 }
-      );
-    }
-
     const query = `
       SELECT
         r.reservation_id,
@@ -72,19 +57,14 @@ export async function GET(request: NextRequest) {
 
 // POST: Create a reservation for the authenticated user.
 export async function POST(request: NextRequest) {
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
+
   let connection;
   let transactionStarted = false;
 
   try {
-    const user = await getAuthenticatedUser(request);
-
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "Authentication required" },
-        { status: 401 }
-      );
-    }
-
     const body = await request.json();
     const { ev_id, point_id, tariff_id, start_time, end_time } = body;
 
@@ -295,19 +275,14 @@ export async function POST(request: NextRequest) {
 
 // DELETE: A customer can cancel only their own active reservation.
 export async function DELETE(request: NextRequest) {
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
+
   let connection;
   let transactionStarted = false;
 
   try {
-    const user = await getAuthenticatedUser(request);
-
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "Authentication required" },
-        { status: 401 }
-      );
-    }
-
     const body = await request.json();
     const { reservation_id } = body;
 
