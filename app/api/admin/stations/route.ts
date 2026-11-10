@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
 import type { PoolConnection } from "mysql2/promise";
 import pool from "@/lib/db";
-import { verifySession } from "@/lib/auth";
+import { getAuthenticatedUser, requireRole } from "@/lib/server-auth";
 import { logActivity } from "@/lib/mongodb";
 
 type StationInput = {
@@ -47,15 +47,6 @@ type ReservationReferenceRow = RowDataPacket & {
   reservation_id: number;
   point_id: number;
 };
-
-async function getSession(request: NextRequest) {
-  const token = request.cookies.get("session")?.value;
-  return token ? verifySession(token) : null;
-}
-
-function adminRequired(status: 401 | 403, message: string) {
-  return NextResponse.json({ success: false, message }, { status });
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -175,11 +166,15 @@ async function writeActivity(
 }
 
 export async function GET(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return adminRequired(401, "Authentication required.");
-  if (session.role !== "admin") {
-    return adminRequired(403, "Administrator access is required for station management.");
-  }
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const session = authentication.user;
+  const forbidden = requireRole(
+    session,
+    "admin",
+    "Administrator access is required for station management."
+  );
+  if (forbidden) return forbidden;
 
   try {
     const [stationRows] = await pool.query<StationRow[]>(
@@ -261,11 +256,15 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return adminRequired(401, "Authentication required.");
-  if (session.role !== "admin") {
-    return adminRequired(403, "Administrator access is required to create stations.");
-  }
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const session = authentication.user;
+  const forbidden = requireRole(
+    session,
+    "admin",
+    "Administrator access is required to create stations."
+  );
+  if (forbidden) return forbidden;
 
   const input = validateStationInput(await readBody(request));
   if (typeof input === "string") {
@@ -361,11 +360,15 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return adminRequired(401, "Authentication required.");
-  if (session.role !== "admin") {
-    return adminRequired(403, "Administrator access is required to update stations.");
-  }
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const session = authentication.user;
+  const forbidden = requireRole(
+    session,
+    "admin",
+    "Administrator access is required to update stations."
+  );
+  if (forbidden) return forbidden;
 
   const body = await readBody(request);
   const stationId = parseId(body?.station_id);
@@ -558,11 +561,15 @@ export async function PATCH(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return adminRequired(401, "Authentication required.");
-  if (session.role !== "admin") {
-    return adminRequired(403, "Administrator access is required to delete stations.");
-  }
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const session = authentication.user;
+  const forbidden = requireRole(
+    session,
+    "admin",
+    "Administrator access is required to delete stations."
+  );
+  if (forbidden) return forbidden;
 
   const body = await readBody(request);
   const stationId = parseId(body?.station_id);

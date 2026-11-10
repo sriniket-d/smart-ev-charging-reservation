@@ -1,36 +1,22 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import pool from "@/lib/db";
-import { verifySession } from "@/lib/auth";
+import { getAuthenticatedUser } from "@/lib/server-auth";
 
 export async function GET(request: NextRequest) {
-  // Read the session outside try/catch.
-  // This allows Next.js to handle dynamic rendering correctly.
-  const token = request.cookies.get("session")?.value;
-
-  if (!token) {
-    return NextResponse.json(
-      { success: false, message: "Authentication required." },
-      { status: 401 }
-    );
-  }
+  // Keep request-dependent authentication outside the catch so Next.js can
+  // handle the Route Handler's dynamic rendering boundary.
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
 
   try {
-    const session = await verifySession(token);
-
-    if (!session) {
-      return NextResponse.json(
-        { success: false, message: "Invalid or expired session." },
-        { status: 401 }
-      );
-    }
-
     const [vehicles] = await pool.query(
       `SELECT ev_id, user_id, vehicle_number, model, connector_type
        FROM evs
        WHERE user_id = ?
        ORDER BY ev_id`,
-      [session.userId]
+      [user.userId]
     );
 
     const [chargingPoints] = await pool.query(`

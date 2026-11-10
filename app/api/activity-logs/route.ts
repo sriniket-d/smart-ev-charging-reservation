@@ -1,25 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifySession } from "@/lib/auth";
+import { getAuthenticatedUser } from "@/lib/server-auth";
 import { getMongoDb } from "@/lib/mongodb";
 
 export async function GET(request: NextRequest) {
-  const token = request.cookies.get("session")?.value;
-
-  if (!token) {
-    return NextResponse.json(
-      { success: false, message: "Authentication required." },
-      { status: 401 }
-    );
-  }
-
-  const user = await verifySession(token);
-
-  if (!user) {
-    return NextResponse.json(
-      { success: false, message: "Invalid or expired session." },
-      { status: 401 }
-    );
-  }
+  const authentication = await getAuthenticatedUser(request);
+  if (!authentication.ok) return authentication.response;
+  const user = authentication.user;
 
   try {
     const db = await getMongoDb();
