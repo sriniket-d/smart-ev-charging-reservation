@@ -1,6 +1,6 @@
 # Test Cases and Verification Status
 
-This matrix records the manual checks demonstrated during local verification on 6 November 2026. Pending and partial results remain explicitly identified; do not treat them as passed without further evidence.
+This matrix records manual checks from 6 November 2026 and the final MongoDB verification completed on 11 November 2026. Pending results remain explicitly identified; do not treat them as passed without further evidence.
 
 ## Previously executed manual checks
 
@@ -27,12 +27,12 @@ Retain screenshots or SQL query output for these checks in the final submission.
 | AUTH-03 | Sign out from the main application sidebar | Session cookie is cleared and the user is returned to the sign-in/create-account page | Passed manually; logout API returned HTTP 200 and redirected to `/login` |
 | AUTH-04 | Change a user's MySQL role while an old session exists | Protected endpoints reject the old session; signing in again issues the updated role | Pending |
 | AUTH-05 | Load the main application with no session | Sidebar offers Sign in / Create account; protected API calls remain unauthorized | Pending |
-| ACT-01 | Call activity-log endpoint without a session | HTTP 401; no activity data returned | Pending |
-| ACT-02 | Customer retrieves activity | Only that customer's events are returned | Passed manually; customer user ID 4 returned only user ID 4 events; console check `Only own activity: true` |
-| ACT-03 | Admin retrieves activity | Recent application-wide events are returned | Passed manually; admin user ID 3 retrieved 11 events across user IDs 1, 3, 4 and 5 |
+| ACT-01 | Call activity-log endpoint without a session | HTTP 401; no activity data returned | Passed manually on 11 November 2026; PowerShell `Invoke-WebRequest` returned HTTP 401. |
+| ACT-02 | Customer retrieves activity | Only that customer's events are returned | Passed manually; customer session for user ID 4 returned only user ID 4 events. Final customer-session response reconfirmed the same isolation on 11 November 2026. |
+| ACT-03 | Admin retrieves activity | Recent application-wide events are returned | Passed manually; admin user ID 3 retrieved 14 events across user IDs 1, 3, 4 and 5 on 11 November 2026. API returned `success: true` and `count: 14`. |
 | ACT-04 | Successful login with MongoDB available | An `auth.login` document is inserted | Passed manually; Compass showed `auth.login` for user ID 3 in local `smart_ev.activity_logs` |
 | ACT-05 | Login while MongoDB is unavailable | Login still succeeds; logging error is isolated | Passed manually; Atlas connection timed out, but login API returned HTTP 200 |
-| ACT-06 | Admin creates, updates and deletes a station | Matching `station.created`, `station.updated` and `station.deleted` events are written | Partial; `station.updated` verified in local MongoDB after switching connection. `station.created` and `station.deleted` not yet rechecked locally |
+| ACT-06 | Admin creates, updates and deletes a station | Matching `station.created`, `station.updated` and `station.deleted` events are written | Passed manually on 11 November 2026; `station.updated` was already present, and temporary station `MongoAuditCheck-1111` produced matching `station.created` and `station.deleted` documents for station ID 5 and admin user ID 3. |
 | PAY-01 | Create a valid reservation | Reservation and Pending payment row are both inserted | Passed manually; reservation #14 and payment #4 verified in MySQL |
 | PAY-02 | Force payment-row insertion to fail in a local test database | Reservation insert rolls back with the transaction | Pending |
 | RES-03 | Submit an overlapping active booking for the same point | API rejects it with HTTP 409 | Passed manually; UI rejected the repeated 09:30–10:30 slot with the overlap error |
@@ -46,6 +46,26 @@ Retain screenshots or SQL query output for these checks in the final submission.
 | ADMIN-06 | Admin deletes a station with reservation history | API rejects deletion with HTTP 409 | Passed manually; UI displayed the reservation-history protection error and retained the station |
 | ADMIN-07 | Admin deletes a station with no reservation history | Points, tariff and station are removed in one transaction | Passed manually; UI confirmed successful deletion and station count decreased from 3 to 2 |
 | ADMIN-08 | Admin submits duplicate point codes | API rejects the request with HTTP 409 and rolls back all inserts | Pending |
+
+## MongoDB final verification — 11 November 2026
+
+The following MongoDB checks were completed against the running local application and
+the `smart_ev.activity_logs` collection. The screenshots and command output captured
+during verification are retained as submission evidence.
+
+| Check | Observed result | Status |
+|---|---|---|
+| Runtime connection and retrieval | MongoDB Compass showed `localhost:27017`, database `smart_ev`, collection `activity_logs`. The authenticated activity API returned HTTP 200 with `success: true`; the final admin response contained 14 documents. | Passed |
+| Supported activity actions | `distinct("action")` returned `auth.login`, `reservation.created`, `reservation.cancelled`, `station.created`, `station.updated` and `station.deleted`. | Passed |
+| Customer access isolation | Customer user ID 4 retrieved only documents with `userId: 4`. | Passed |
+| Admin access | Admin user ID 3 retrieved 14 application-wide documents spanning user IDs 1, 3, 4 and 5. | Passed |
+| Unauthenticated retrieval | `GET /api/activity-logs` without a session returned HTTP 401. | Passed |
+| Station create/delete audit events | Temporary station `MongoAuditCheck-1111` generated `station.created` and `station.deleted` documents; both used station entity ID 5 and admin user ID 3. | Passed |
+| MongoDB indexes | `getIndexes()` showed `idx_activity_logs_timestamp`, `idx_activity_logs_user_timestamp`, `idx_activity_logs_action_timestamp`, plus MongoDB's default `_id_` index. | Passed |
+| Aggregation pipeline | The `$group` / `$project` / `$sort` pipeline executed and returned counts: `auth.login` 5, `reservation.cancelled` 4, `reservation.created` 2, and each of `station.created`, `station.deleted`, `station.updated` 1 (14 events total). | Passed |
+
+The local app's configured MongoDB connection was exercised through the activity retrieval API.
+No MongoDB schema or application feature changes were needed for this final verification.
 
 ## Session role and deleted-account regression checks
 
