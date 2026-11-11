@@ -108,7 +108,7 @@ export async function POST(request: NextRequest) {
 
     // Lock the charging point while validating and creating the reservation.
     const [points] = await connection.query(
-      `SELECT station_id, status
+      `SELECT station_id, status, connector_type
        FROM charging_points
        WHERE point_id = ?
        FOR UPDATE`,
@@ -118,6 +118,7 @@ export async function POST(request: NextRequest) {
     const pointRows = points as {
       station_id: number;
       status: string;
+      connector_type: string;
     }[];
 
     if (pointRows.length === 0) {
@@ -162,11 +163,18 @@ export async function POST(request: NextRequest) {
 
     // Never trust a user_id supplied by the browser.
     const [vehicles] = await connection.query(
-      "SELECT ev_id FROM evs WHERE ev_id = ? AND user_id = ?",
+      `SELECT ev_id, connector_type
+       FROM evs
+       WHERE ev_id = ? AND user_id = ?`,
       [ev_id, user.userId]
     );
 
-    if ((vehicles as unknown[]).length === 0) {
+    const vehicleRows = vehicles as {
+      ev_id: number;
+      connector_type: string;
+    }[];
+
+    if (vehicleRows.length === 0) {
       await connection.rollback();
       transactionStarted = false;
 
@@ -176,6 +184,23 @@ export async function POST(request: NextRequest) {
           message: "Vehicle not found for the authenticated user",
         },
         { status: 403 }
+      );
+    }
+
+    // Enforce connector compatibility on the server.
+    if (
+      vehicleRows[0].connector_type !== pointRows[0].connector_type
+    ) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Vehicle connector is incompatible with the selected charging point",
+        },
+        { status: 400 }
       );
     }
 
